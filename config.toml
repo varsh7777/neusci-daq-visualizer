@@ -1,0 +1,29 @@
+# Copy and edit per rig. Find the device name with:  python -m neusci_daq --list-devices
+[device]
+backend = "nidaqmx"        # "nidaqmx" (hardware-timed) | "multichannelio" (software-polled) | "simulated"
+device = "Dev1"
+sample_rate = 2000         # Hz PER CHANNEL. channels x rate must be <= 100000 on a USB-6003.
+chunk_size = 100           # samples/channel per read -> 50 ms display latency here
+terminal_config = "RSE"    # "RSE" (ai0-ai7) or "DIFF" (ai0-ai3, using ai4-ai7 as negatives)
+
+[display]
+window_s = 10
+
+[recording]
+directory = "data"
+
+# scale/offset convert volts at the DAQ input to your units: value = volts*scale + offset.
+# Example: an amplifier with gain 1000, displaying mV at the electrode:
+#   scale = 1000 (mV per V) / 1000 (gain) = 1.0, units = "mV"
+# Only raw volts are saved; scale/offset are stored as metadata so you can fix them later.
+[[channels]]
+physical = "ai0"
+name = "Ch1"
+units = "V"
+scale = 1.0
+
+[[channels]]
+physical = "ai1"
+name = "Ch2"
+units = "V"
+scale = 1.0

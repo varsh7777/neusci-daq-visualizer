@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "neusci-daq-visualizer"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = ["numpy", "pyqtgraph>=0.13", "PyQt6", "h5py"]
+
+[project.optional-dependencies]
+nidaqmx = ["nidaqmx>=1.0"]
+multichannelio = ["PyDAQmx"]
+dev = ["pytest"]
+
+[project.scripts]
+neusci-daq = "neusci_daq.__main__:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
