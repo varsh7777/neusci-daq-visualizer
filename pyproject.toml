@@ -6,12 +6,12 @@ build-backend = "setuptools.build_meta"
 name = "neusci-daq-visualizer"
 version = "0.1.0"
 requires-python = ">=3.11"
-dependencies = ["numpy", "pyqtgraph>=0.13", "PyQt6", "h5py"]
+dependencies = ["numpy", "scipy", "pyqtgraph>=0.13", "PyQt6", "h5py"]
 
 [project.optional-dependencies]
 nidaqmx = ["nidaqmx>=1.0"]
 multichannelio = ["PyDAQmx"]
-dev = ["pytest"]
+dev = ["pytest", "neuscitk", "scikit-learn", "matplotlib"]
 
 [project.scripts]
 neusci-daq = "neusci_daq.__main__:main"
