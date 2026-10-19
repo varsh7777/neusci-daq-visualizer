@@ -64,4 +64,4 @@ def test_example_config_loads():
     with warnings.catch_warnings():
         warnings.simplefilter("error")
         cfg = config.load("config.toml")
-    assert cfg.backend == "nidaqmx" and len(cfg.channels) == 4
+    assert cfg.backend == "nidaqmx" and cfg.channels   # whatever channels this rig uses

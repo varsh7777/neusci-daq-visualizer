@@ -12,6 +12,21 @@ from pathlib import Path
 USB6003_MAX_AGGREGATE_RATE = 100_000
 USB6003_RANGE = (-10.0, 10.0)
 
+# Offered in the Sampling rate box; any other positive value can be typed in.
+RATE_PRESETS = (100, 200, 500, 1000, 2000, 5000, 10000, 20000, 25000, 50000, 100000)
+# When the rate is changed in the app, read about this much data at a time.
+READ_INTERVAL_S = 0.05
+
+
+def auto_chunk_size(rate: float) -> int:
+    """Samples per channel per read for ~50 ms display latency at `rate`."""
+    return max(1, round(rate * READ_INTERVAL_S))
+
+
+def max_rate(n_channels: int) -> int:
+    """Highest per-channel rate the USB-6003 allows with this many channels on."""
+    return USB6003_MAX_AGGREGATE_RATE // max(1, n_channels)
+
 
 @dataclass
 class Channel:
@@ -92,7 +107,7 @@ def validate(cfg: Config) -> None:
         raise ValueError(
             f"{n} ch × {cfg.sample_rate:g} Hz = {cfg.aggregate_rate:g} S/s, over the USB-6003's "
             f"{USB6003_MAX_AGGREGATE_RATE:,} S/s limit. With {n} channel(s), use at most "
-            f"{USB6003_MAX_AGGREGATE_RATE // n:,} Hz per channel.")
+            f"{max_rate(n):,} Hz per channel.")
     allowed = valid_inputs(cfg)
     seen: dict[str, str] = {}
     names: set[str] = set()

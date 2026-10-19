@@ -131,11 +131,11 @@ def test_changing_channels_after_recording_starts_new_session(win, app):
     first = win.session_dir
     assert first is not None and win.blocks
 
-    win._confirm_new_session_for_channels = lambda: False      # Cancel
+    win._confirm_new_session = lambda what: False      # Cancel
     assert not edit(win, 1, "physical", "ai2")
     assert win.session_dir == first
 
-    win._confirm_new_session_for_channels = lambda: True       # OK
+    win._confirm_new_session = lambda what: True      # OK
     assert edit(win, 1, "physical", "ai2")
     assert win.session_dir is None and not win.blocks          # fresh session
     assert win.btn_run.isChecked()                             # still acquiring

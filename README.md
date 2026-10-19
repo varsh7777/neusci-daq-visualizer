@@ -1,7 +1,7 @@
 
 # neusci-daq-visualizer
 
-Application designed to visualize recordings from data acquisition systems for students within the University of Washington's undergraduate neuroscience program. Designed for and tested with NI USB-6003 from National Instruments using PyDAQmx with the NIDAQmx driver. 
+Application designed to visualize recordings from data acquisition systems for students within the University of Washington's undergraduate neuroscience program. Designed for and tested with NI USB-6003 from National Instruments using the NIDAQmx driver. 
 
 ## Why/what?
 
@@ -9,7 +9,7 @@ Application designed to visualize recordings from data acquisition systems for s
   
   
   
-The UW undergraduate neuroscience program historically uses an A-M Systems 3000 AC/DC Differential Amplifier, a Humbug 60 Hz Noise Eliminator, and an AD Instruments PowerLab 4/26 Digitizer in concordance with LabChart 7 to record and analyze signals recorded from different model organisms. By doing so, students can learn about different information processing modalities in these model organisms to build neurobiology fundamentals. However, this system is dated and difficult to use on different operating systems. neusci-daq-visualizer is a flexible Python-based visualizer to transform signals into a computer-interpretable form and visualize it to make data analysis easy and efficient. We aim to cut out the PowerLab (which we are replacing with an NI USB-60030 and LabChart dependence with our tool.
+The UW undergraduate neuroscience program historically uses an A-M Systems 3000 AC/DC Differential Amplifier, a Humbug 60 Hz Noise Eliminator, and an AD Instruments PowerLab 4/26 Digitizer in concordance with LabChart 7 to record and analyze signals recorded from different model organisms. By doing so, students can learn about different information processing modalities in these model organisms to build neurobiology fundamentals. However, this system is dated and difficult to use on different operating systems. neusci-daq-visualizer is a flexible Python-based visualizer to transform signals into a computer-interpretable form and visualize it to make data analysis easy and efficient. We aim to cut out the PowerLab (which we are replacing with an NI USB-6003) and LabChart dependence with our tool.
 
 ## Install
 Requires Python 3.11+. For recording, install the

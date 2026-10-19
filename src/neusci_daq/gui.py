@@ -12,6 +12,12 @@ File menu:
   Export…    write the session's blocks to a .mat file anywhere
   Recent Sessions
 
+Setup menu:
+  Input wiring   RSE (8 inputs vs AI GND) or DIFF (4 inputs, aiN minus ai(N+4))
+
+The toolbar's Sampling rate box sets samples per second per channel. The
+status bar always shows the wiring mode.
+
 Recording always writes blocks to disk immediately. Until a session is saved,
 its blocks live in <data_dir>/unsaved/<session>/, so nothing is lost if the
 program crashes or someone chooses Don't Save.
@@ -70,7 +76,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self._build_live_plots()
         self._alloc_buffers()
         self.timer = QtCore.QTimer(self, interval=33, timeout=self._refresh)
+        self._rate_busy = False
         self._set_mode(LIVE)
+        self._sync_setup_controls()
 
     # ======================================================================
     # UI construction
@@ -82,6 +90,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btn_run.toggled.connect(self._toggle_run)
         self.btn_rec = QtWidgets.QPushButton("● Record", checkable=True, enabled=False)
         self.btn_rec.toggled.connect(self._toggle_rec)
+        # Editable: pick a preset or type any rate, then press Enter.
+        self.rate_box = QtWidgets.QComboBox(editable=True)
+        self.rate_box.setInsertPolicy(QtWidgets.QComboBox.InsertPolicy.NoInsert)
+        self.rate_box.addItems([f"{r:,} Hz" for r in cfgmod.RATE_PRESETS])
+        self.rate_box.setMinimumContentsLength(9)
+        self.rate_box.lineEdit().editingFinished.connect(self._rate_entered)
+        self.rate_box.activated.connect(lambda *_: self._rate_entered())
         self.window_box = QtWidgets.QDoubleSpinBox(minimum=0.01, maximum=600, value=self.cfg.window_s,
                                                    suffix=" s window", decimals=2)
         self.window_box.valueChanged.connect(self._window_changed)
@@ -93,7 +108,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btn_live = QtWidgets.QPushButton("Back to Live")
         self.btn_live.clicked.connect(self.back_to_live)
 
-        self._live_actions = [tb.addWidget(self.btn_run), tb.addWidget(self.btn_rec)]
+        self._live_actions = [tb.addWidget(self.btn_run), tb.addWidget(self.btn_rec),
+                              tb.addWidget(QtWidgets.QLabel("  Sampling rate ")),
+                              tb.addWidget(self.rate_box), tb.addWidget(QtWidgets.QLabel(" "))]
         self._review_actions = [tb.addWidget(QtWidgets.QLabel(" Block: ")), tb.addWidget(self.block_combo)]
         tb.addWidget(self.window_box)
         self._live_actions.append(tb.addWidget(self.comment_edit))
@@ -130,6 +147,10 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.status = QtWidgets.QLabel()
         self.statusBar().addPermanentWidget(self.status)
+        # Always visible, so a wrong wiring mode can't go unnoticed.
+        self.wiring_label = QtWidgets.QLabel()
+        self.wiring_label.setToolTip("Input wiring mode. Change it under Setup → Input wiring.")
+        self.statusBar().addPermanentWidget(self.wiring_label)
 
     def _build_menu(self):
         m = self.menuBar().addMenu("&File")
@@ -149,6 +170,24 @@ class MainWindow(QtWidgets.QMainWindow):
         self.recent_menu = m.addMenu("&Recent Sessions")
         self.recent_menu.aboutToShow.connect(self._fill_recent_menu)
         m.aboutToShow.connect(self._update_menu_state)
+
+        s = self.menuBar().addMenu("&Setup")
+        self.wiring_menu = s.addMenu("Input &wiring")
+        group = QtGui.QActionGroup(self)
+        self.act_wiring = {}
+        for mode, text, tip in (
+                ("RSE", "RSE — up to 8 inputs (aiN vs AI GND)",
+                 "Each input is measured against AI GND. Every input you use must have a "
+                 "connection to AI GND, or it picks up mains hum."),
+                ("DIFF", "DIFF — up to 4 inputs (aiN minus ai(N+4))",
+                 "Each input is measured against its partner: ai0−ai4, ai1−ai5, ai2−ai6, ai3−ai7. "
+                 "Rejects hum common to both wires.")):
+            a = self.wiring_menu.addAction(text, lambda mode=mode: self.apply_setup(terminal_config=mode))
+            a.setCheckable(True)
+            a.setToolTip(tip)
+            group.addAction(a)
+            self.act_wiring[mode] = a
+        self.wiring_menu.setToolTipsVisible(True)
 
     # -- plots -------------------------------------------------------------
     def _clear_plot_area(self):
@@ -216,6 +255,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.plot_layout.addWidget(row_w, 0)
         self._finish_plots()
         self.btn_add_ch.setEnabled(not locked)
+        self.rate_box.setEnabled(not locked)
 
     def _build_review_plots(self, names: list[str], units: list[str]):
         """Plots for a saved session: one per recorded channel, no controls."""
@@ -255,22 +295,45 @@ class MainWindow(QtWidgets.QMainWindow):
         return [(c.physical, c.name, c.units) for c in channels]
 
     def apply_channels(self, rows: list[ChannelRow]) -> bool:
-        """Switch to a new channel setup. Restarts acquisition if it was running.
+        """Switch to a new channel setup (see apply_setup)."""
+        return self.apply_setup(rows=rows)
 
-        Refused while recording. If the session already has blocks with a
-        different setup, a new session is started, because every block in a
-        session must have the same channels to export as one .mat file.
+    def apply_setup(self, rows: list[ChannelRow] | None = None, sample_rate: float | None = None,
+                    terminal_config: str | None = None) -> bool:
+        """Change channels, sampling rate and/or input wiring. Restarts acquisition if running.
+
+        Refused while recording. If the session already has blocks recorded with
+        a different setup, a new session is started, because every block in a
+        session must match to export as one .mat file.
         """
+        what = ("sampling rate" if sample_rate is not None else
+                "input wiring" if terminal_config is not None else "channels")
+
         def refuse(msg):
             self._channel_message(msg)
             self._build_live_plots()   # put the controls back as they were
+            self._sync_setup_controls()
             return False
 
         if self.recorder.recording:
-            return refuse("Stop recording before changing channels.")
+            return refuse(f"Stop recording before changing the {what}.")
         if self.mode != LIVE:
-            return refuse("Go back to live mode to change channels.")
-        trial = self.cfg.with_channels([r.ch for r in rows])
+            return refuse(f"Go back to live mode to change the {what}.")
+        rows = self._copy_rows() if rows is None else rows
+        changes = {}
+        if sample_rate is not None:
+            changes["sample_rate"] = float(sample_rate)
+            changes["chunk_size"] = cfgmod.auto_chunk_size(sample_rate)
+        if terminal_config is not None:
+            changes["terminal_config"] = terminal_config
+            if terminal_config == "DIFF":
+                # Say which channel to move, rather than a generic "ai5 isn't available".
+                stuck = [r.ch for r in rows if r.ch.physical not in ("ai0", "ai1", "ai2", "ai3")]
+                if stuck:
+                    names = ", ".join(f"{c.name} ({c.physical})" for c in stuck)
+                    return refuse(f"Can't switch to DIFF: {names} must move to ai0–ai3 or be removed "
+                                  "first, because DIFF uses ai4–ai7 as the minus inputs.")
+        trial = self.cfg.with_channels([r.ch for r in rows], **changes)
         try:
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore")
@@ -279,38 +342,104 @@ class MainWindow(QtWidgets.QMainWindow):
             return refuse(str(e))
 
         running = self.btn_run.isChecked()
-        hardware_changed = ([(c.physical, c.enabled) for c in trial.channels]
-                            != [(c.physical, c.enabled) for c in self.cfg.channels])
-        if self.blocks and self._layout(trial.channels) != self._layout(self.cfg.channels):
-            if not self._confirm_new_session_for_channels():
-                return refuse("Channels unchanged.")
+        settings_changed = (trial.sample_rate != self.cfg.sample_rate
+                            or trial.terminal_config != self.cfg.terminal_config)
+        hardware_changed = settings_changed or (
+            [(c.physical, c.enabled) for c in trial.channels]
+            != [(c.physical, c.enabled) for c in self.cfg.channels])
+        if self.blocks and (settings_changed
+                            or self._layout(trial.channels) != self._layout(self.cfg.channels)):
+            if not self._confirm_new_session(what):
+                return refuse(f"{what.capitalize()} unchanged.")
             if not self.new_session():          # asks Save / Don't Save if unsaved
-                return refuse("Channels unchanged.")
+                return refuse(f"{what.capitalize()} unchanged.")
         if running and hardware_changed:
             self.btn_run.setChecked(False)
 
         self.rows = rows
         self.cfg.channels, self.cfg.spare_channels = trial.channels, trial.spare_channels
+        self.cfg.sample_rate, self.cfg.chunk_size = trial.sample_rate, trial.chunk_size
+        self.cfg.terminal_config = trial.terminal_config
         if hardware_changed:
             self.buf_t = np.empty(0)
             self.buf_y = np.empty((len(self.cfg.channels), 0))
             self._alloc_buffers()
         self._build_live_plots()
         self._redraw_live()
+        self._sync_setup_controls()
         if running and hardware_changed and not self.btn_run.isChecked():
             self.btn_run.setChecked(True)
-        on = ", ".join(f"{c.name} = {c.physical}" for c in self.cfg.channels)
-        self.statusBar().showMessage(f"Channels: {on}", 8000)
+        if what == "channels":
+            on = ", ".join(f"{c.name} = {c.physical}" for c in self.cfg.channels)
+            self.statusBar().showMessage(f"Channels: {on}", 8000)
+        elif what == "sampling rate":
+            self.statusBar().showMessage(f"Sampling rate: {self.cfg.sample_rate:,g} Hz per channel", 8000)
+        else:
+            self.statusBar().showMessage(f"Input wiring: {self.cfg.terminal_config}", 8000)
         return True
 
-    def _confirm_new_session_for_channels(self) -> bool:
+    def _confirm_new_session(self, what: str) -> bool:
         B = QtWidgets.QMessageBox.StandardButton
         r = QtWidgets.QMessageBox.question(
-            self, "Channels changed",
-            "This session's blocks were recorded with the old channels. All blocks in a session "
-            "must have the same channels, so changing them starts a new session.\n\nContinue?",
+            self, f"{what.capitalize()} changed",
+            f"This session's blocks were recorded with the old {what}. All blocks in a session "
+            f"must match, so changing the {what} starts a new session.\n\nContinue?",
             B.Ok | B.Cancel, B.Ok)
         return r == B.Ok
+
+    # -- sampling rate and wiring ------------------------------------------
+    @staticmethod
+    def _parse_rate(text: str) -> float | None:
+        t = text.lower().replace(",", "").replace("hz", "").strip()
+        mult = 1.0
+        if t.endswith("k"):
+            t, mult = t[:-1].strip(), 1000.0
+        try:
+            v = float(t) * mult
+        except ValueError:
+            return None
+        return v if v > 0 else None
+
+    def _rate_entered(self):
+        # Selecting a preset fires both activated and editingFinished, and a
+        # dialog taking focus fires editingFinished again: handle only one.
+        if self._rate_busy:
+            return
+        self._rate_busy = True
+        try:
+            self._apply_entered_rate()
+        finally:
+            self._rate_busy = False
+
+    def _apply_entered_rate(self):
+        rate = self._parse_rate(self.rate_box.currentText())
+        if rate is None:
+            self._channel_message(f"{self.rate_box.currentText()!r} isn't a sampling rate. "
+                                  "Type a number of Hz, e.g. 1000 or 20k.")
+            self._sync_setup_controls()
+            return
+        if rate != self.cfg.sample_rate:
+            self.apply_setup(sample_rate=rate)
+        else:
+            self._sync_setup_controls()   # tidy the text, e.g. "1000" -> "1,000 Hz"
+
+    def _sync_setup_controls(self):
+        """Show the current rate and wiring in the toolbar, menu and status bar."""
+        self.rate_box.blockSignals(True)
+        self.rate_box.setEditText(f"{self.cfg.sample_rate:,g} Hz")
+        self.rate_box.blockSignals(False)
+        n = len(self.cfg.channels)
+        self.rate_box.setToolTip(f"Samples per second, per channel. With {n} channel(s) on, "
+                                 f"the USB-6003 allows up to {cfgmod.max_rate(n):,} Hz.")
+        self.act_wiring[self.cfg.terminal_config].setChecked(True)
+        self._update_wiring_label()
+
+    def _update_wiring_label(self):
+        if self.mode == REVIEW:
+            tc = (self.review_block or {}).get("terminal_config")
+            self.wiring_label.setText(f"  recorded in {tc}  " if tc else "")
+        else:
+            self.wiring_label.setText(f"  {self.cfg.terminal_config} wiring  ")
 
     def _channel_message(self, text: str):
         self.statusBar().showMessage(f"⚠ {text}", 10000)
@@ -346,7 +475,9 @@ class MainWindow(QtWidgets.QMainWindow):
             a.setVisible(mode == REVIEW)
         self.scroll.setVisible(mode == REVIEW)
         self.channel_bar.setVisible(mode == LIVE)
+        self.wiring_menu.setEnabled(mode == LIVE and not self.recorder.recording)
         self._update_title()
+        self._update_wiring_label()
 
     def _update_title(self):
         if self.mode == REVIEW and self.review_dir is not None:
@@ -688,6 +819,7 @@ class MainWindow(QtWidgets.QMainWindow):
         for t, text in blk["comments"]:
             self._add_marker(t, text)
         self._update_scroll_range()
+        self._update_wiring_label()
         self.plots[0].setXRange(0, min(self.window_box.value(), max(blk["duration_s"], 1e-3)), padding=0)
         self.status.setText(
             f"Reviewing {self.review_blocks[index].stem} ({index + 1}/{len(self.review_blocks)}) · "
@@ -781,6 +913,8 @@ class MainWindow(QtWidgets.QMainWindow):
         for st in self.strips:
             st.setEnabled(not locked)
         self.btn_add_ch.setEnabled(not locked)
+        self.rate_box.setEnabled(not locked)
+        self.wiring_menu.setEnabled(not locked and self.mode == LIVE)
 
     def _redraw_live(self):
         if self.buf_t.size and self.buf_y.shape[0] == len(self.curves):

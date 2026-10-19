@@ -130,6 +130,7 @@ def read_block(path: str | Path) -> dict:
             "t": t, "data": data, "comments": comments, "sample_rate": fs,
             "channel_names": [str(x) for x in a["channel_names"]],
             "units": [str(x) for x in a["units"]],
+            "terminal_config": str(a["terminal_config"]) if "terminal_config" in a else None,
             "duration_s": float(t[-1]) if t.size else 0.0,
         }
 

@@ -2,9 +2,9 @@
 [device]
 backend = "nidaqmx"        # "nidaqmx" (hardware-timed) | "multichannelio" (software-polled) | "simulated"
 device = "Dev1"
-sample_rate = 2000         # Hz PER CHANNEL. channels x rate must be <= 100000 on a USB-6003.
+sample_rate = 1000         # Hz PER CHANNEL. channels x rate must be <= 100000 on a USB-6003.
 chunk_size = 100           # samples/channel per read -> 50 ms display latency here
-terminal_config = "RSE"    # "RSE" (ai0-ai7) or "DIFF" (ai0-ai3, using ai4-ai7 as negatives)
+terminal_config = "DIFF"    # "RSE" (ai0-ai7) or "DIFF" (ai0-ai3, using ai4-ai7 as negatives)
 
 [display]
 window_s = 10

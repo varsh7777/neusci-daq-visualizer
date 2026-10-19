@@ -222,3 +222,28 @@ def test_save_without_recording_does_nothing(tmp_path, app, settings):
     with pytest.raises(session.SessionError, match="Nothing"):
         w.save_as(tmp_path / "x")
     w.close()
+
+
+def test_restart_discards_leftover_chunks_from_previous_run(tmp_path, app, settings):
+    """After Stop then Start, data left over from the old run must not be drawn.
+
+    Each run's timestamps start again from 0, so an old chunk (with large
+    timestamps) would be drawn on top of the new run, joined to it by a long line.
+    """
+    from neusci_daq.backends import Chunk
+    from neusci_daq.gui import MainWindow
+
+    w = MainWindow(make_cfg(tmp_path), settings=settings)
+    w.btn_run.setChecked(True)
+    pump(app, 0.3)
+    w.btn_run.setChecked(False)
+    # A chunk from the old run, still waiting when Start is pressed again.
+    n = len(w.cfg.channels)
+    w.display_q.put(Chunk(np.zeros((n, 100)), 100.0 + np.arange(100) / w.cfg.sample_rate, 200_000))
+    w.btn_run.setChecked(True)
+    pump(app, 0.3)
+    w.btn_run.setChecked(False)
+    assert w.buf_t.size, "nothing was acquired after restarting"
+    assert np.all(np.diff(w.buf_t) > 0), "time went backwards in the display buffer"
+    assert w.buf_t.max() < 100, "data from the previous run was drawn"
+    w.close()
