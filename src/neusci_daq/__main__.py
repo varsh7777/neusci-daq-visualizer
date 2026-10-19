@@ -23,7 +23,7 @@ def main(argv=None):
         cfg.backend = args.backend
         config.validate(cfg)
     from .gui import run
-    return run(cfg)
+    return run(cfg, config_path=args.config)
 
 
 if __name__ == "__main__":

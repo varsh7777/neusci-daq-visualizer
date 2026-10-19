@@ -34,7 +34,8 @@ class Recorder:
         self.samples_written = 0
         self.last_t = 0.0
         self.last_index = 0
-        threading.Thread(target=self._consume, daemon=True, name="daq-rec").start()
+        self._thread = threading.Thread(target=self._consume, daemon=True, name="daq-rec")
+        self._thread.start()
 
     @property
     def recording(self) -> bool:
@@ -56,6 +57,7 @@ class Recorder:
         a["sample_rate"] = self.backend.actual_rate
         a["hardware_timed"] = self.backend.hardware_timed
         a["device"], a["backend"] = cfg.device, cfg.backend
+        a["terminal_config"] = cfg.terminal_config
         a["start_time"] = datetime.now().isoformat()
         a["channel_names"] = [c.name for c in cfg.channels]
         a["physical"] = [c.physical for c in cfg.channels]
@@ -67,6 +69,12 @@ class Recorder:
             self._t_offset = None
             self._file, self.path = f, Path(path)
         return self.path
+
+    def close(self) -> None:
+        """Stop recording and end the writer thread (call before the program exits)."""
+        self.stop()
+        self._q.put(None)
+        self._thread.join(timeout=5)
 
     def stop(self) -> None:
         with self._lock:
@@ -89,7 +97,9 @@ class Recorder:
 
     def _consume(self):
         while True:
-            chunk: Chunk = self._q.get()
+            chunk: Chunk | None = self._q.get()
+            if chunk is None:   # sent by close()
+                return
             self.last_t, self.last_index = float(chunk.t[-1]), chunk.start_index
             with self._lock:
                 if self._file is None:

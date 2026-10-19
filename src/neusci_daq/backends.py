@@ -90,8 +90,11 @@ class SimulatedBackend(Backend):
         while not self._stop.is_set():
             t = (idx + np.arange(cs)) / fs
             data = np.empty((n, cs))
-            for i in range(n):
-                data[i] = 0.5 * np.sin(2 * np.pi * (1 + i) * t) + 0.02 * self._rng.standard_normal(cs)
+            for i, ch in enumerate(self.cfg.channels):
+                # Each input has its own signal (aiN: a sine at N+1 Hz), so
+                # switching a channel's input visibly changes its trace.
+                k = int(ch.physical[2:]) if ch.physical[2:].isdigit() else i
+                data[i] = 0.5 * np.sin(2 * np.pi * (1 + k) * t) + 0.02 * self._rng.standard_normal(cs)
                 spikes = self._rng.random(cs) < 2 / fs   # ~2 spikes/s
                 data[i, spikes] += 2.0
             self._publish(Chunk(data, t, idx))

@@ -18,8 +18,11 @@ program crashes or someone chooses Don't Save.
 """
 from __future__ import annotations
 
+import dataclasses
 import queue
 import shutil
+import sys
+import warnings
 from datetime import datetime
 from pathlib import Path
 
@@ -27,9 +30,11 @@ import numpy as np
 import pyqtgraph as pg
 from pyqtgraph.Qt import QtCore, QtGui, QtWidgets
 
+from . import config as cfgmod
 from . import session
 from .backends import Backend, make_backend
-from .config import Config
+from .channels import ChannelRow, ChannelStrip
+from .config import Channel, Config, valid_inputs
 from .export import to_labchart_mat
 from .recorder import Recorder
 
@@ -37,9 +42,11 @@ LIVE, REVIEW = "live", "review"
 
 
 class MainWindow(QtWidgets.QMainWindow):
-    def __init__(self, cfg: Config, settings: QtCore.QSettings | None = None):
+    def __init__(self, cfg: Config, settings: QtCore.QSettings | None = None,
+                 config_path: str | Path | None = None):
         super().__init__()
-        self.cfg = cfg
+        self.cfg = cfg   # shared with the backend and recorder; channel changes update it in place
+        self.config_path = Path(config_path) if config_path else None
         self.settings = settings or QtCore.QSettings("neusci", "neusci-daq-visualizer")
         self.backend: Backend = make_backend(cfg)
         self.display_q: queue.Queue = self.backend.subscribe()
@@ -55,10 +62,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self.review_dir: Path | None = None
         self.review_blocks: list[Path] = []
         self.review_block: dict | None = None
+        # The channel setup the user edits in the strips next to each plot.
+        self.rows = [ChannelRow(c, i) for i, c in enumerate(cfg.channels + cfg.spare_channels)]
 
         self._build_ui()
         self._build_menu()
-        self._build_plots([c.name for c in cfg.channels], [c.units for c in cfg.channels])
+        self._build_live_plots()
         self._alloc_buffers()
         self.timer = QtCore.QTimer(self, interval=33, timeout=self._refresh)
         self._set_mode(LIVE)
@@ -94,10 +103,28 @@ class MainWindow(QtWidgets.QMainWindow):
         lay = QtWidgets.QVBoxLayout(central)
         lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(0)
-        self.glw = pg.GraphicsLayoutWidget()
+        self.plot_area = QtWidgets.QWidget()
+        self.plot_layout = QtWidgets.QVBoxLayout(self.plot_area)
+        self.plot_layout.setContentsMargins(0, 0, 0, 0)
+        self.plot_layout.setSpacing(2)
+        self.plots, self.curves, self.strips = [], [], []
+
+        self.channel_bar = QtWidgets.QWidget()
+        cb = QtWidgets.QHBoxLayout(self.channel_bar)
+        cb.setContentsMargins(4, 2, 4, 2)
+        self.btn_add_ch = QtWidgets.QPushButton("+ Add channel")
+        self.btn_add_ch.clicked.connect(lambda: QtCore.QTimer.singleShot(0, self.add_channel))
+        self.btn_save_setup = QtWidgets.QPushButton("Save channel setup…")
+        self.btn_save_setup.setToolTip("Save these channels to a config file to reuse later")
+        self.btn_save_setup.clicked.connect(self.save_setup_dialog)
+        cb.addWidget(self.btn_add_ch)
+        cb.addWidget(self.btn_save_setup)
+        cb.addStretch(1)
+
         self.scroll = QtWidgets.QScrollBar(QtCore.Qt.Orientation.Horizontal)
         self.scroll.valueChanged.connect(self._scrolled)
-        lay.addWidget(self.glw)
+        lay.addWidget(self.plot_area, 1)
+        lay.addWidget(self.channel_bar)
         lay.addWidget(self.scroll)
         self.setCentralWidget(central)
 
@@ -123,26 +150,182 @@ class MainWindow(QtWidgets.QMainWindow):
         self.recent_menu.aboutToShow.connect(self._fill_recent_menu)
         m.aboutToShow.connect(self._update_menu_state)
 
-    def _build_plots(self, names: list[str], units: list[str]):
-        """(Re)create one stacked plot per channel."""
+    # -- plots -------------------------------------------------------------
+    def _clear_plot_area(self):
         self._clear_markers()
-        self.glw.clear()
-        self.plots, self.curves = [], []
+        while self.plot_layout.count():
+            w = self.plot_layout.takeAt(0).widget()
+            if w is not None:
+                w.setParent(None)
+                w.deleteLater()
+        self.plots, self.curves, self.strips = [], [], []
+
+    def _new_plot(self, name: str, unit: str, color: int, n_colors: int) -> pg.PlotWidget:
+        pw = pg.PlotWidget()
+        p = pw.getPlotItem()
+        p.setLabel("left", name, units=unit)
+        p.getAxis("left").setWidth(70)   # same width on every plot, so time axes line up
+        p.showGrid(x=True, y=True, alpha=0.2)
+        # Peak downsampling keeps spikes visible when zoomed out.
+        p.setDownsampling(auto=True, mode="peak")
+        p.setClipToView(True)
+        p.enableAutoRange(axis="y", enable=True)
+        p.setAutoVisible(y=True)
+        if self.plots:
+            p.setXLink(self.plots[0])
+        self.plots.append(p)
+        self.curves.append(p.plot(pen=pg.intColor(color, hues=max(3, n_colors))))
+        return pw
+
+    def _finish_plots(self):
+        if self.plots:
+            self.plots[-1].setLabel("bottom", "time", units="s")
+            self.plots[0].sigXRangeChanged.connect(self._xrange_changed)
+
+    def _n_colors(self) -> int:
+        return max(r.color for r in self.rows) + 1 if self.rows else 3
+
+    def _build_live_plots(self):
+        """One row per channel: its controls on the left, its plot on the right.
+
+        A switched-off channel keeps its controls, so it can be switched back on,
+        but has no plot.
+        """
+        self._clear_plot_area()
+        inputs = valid_inputs(self.cfg)
+        n_colors = self._n_colors()
+        locked = self.recorder.recording
+        for r in self.rows:
+            row_w = QtWidgets.QWidget()
+            h = QtWidgets.QHBoxLayout(row_w)
+            h.setContentsMargins(0, 0, 0, 0)
+            strip = ChannelStrip(r, inputs, n_colors, self.cfg.terminal_config == "DIFF",
+                                 self._channel_edited, self._channel_removed,
+                                 can_remove=len(self.rows) > 1)
+            strip.setEnabled(not locked)
+            self.strips.append(strip)
+            h.addWidget(strip, 0)
+            if r.ch.enabled:
+                h.addWidget(self._new_plot(r.ch.name, r.ch.units, r.color, n_colors), 1)
+                self.plot_layout.addWidget(row_w, 1)
+            else:
+                off = QtWidgets.QLabel("off")
+                off.setStyleSheet("color: gray; padding-left: 8px")
+                h.addWidget(off, 1)
+                strip.setMaximumHeight(strip.sizeHint().height())
+                self.plot_layout.addWidget(row_w, 0)
+        self._finish_plots()
+        self.btn_add_ch.setEnabled(not locked)
+
+    def _build_review_plots(self, names: list[str], units: list[str]):
+        """Plots for a saved session: one per recorded channel, no controls."""
+        self._clear_plot_area()
         for i, (name, unit) in enumerate(zip(names, units)):
-            p = self.glw.addPlot(row=i, col=0)
-            p.setLabel("left", name, units=unit)
-            p.showGrid(x=True, y=True, alpha=0.2)
-            # Peak downsampling keeps spikes visible when zoomed out.
-            p.setDownsampling(auto=True, mode="peak")
-            p.setClipToView(True)
-            p.enableAutoRange(axis="y", enable=True)
-            p.setAutoVisible(y=True)
-            if self.plots:
-                p.setXLink(self.plots[0])
-            self.plots.append(p)
-            self.curves.append(p.plot(pen=pg.intColor(i, hues=max(3, len(names)))))
-        self.plots[-1].setLabel("bottom", "time", units="s")
-        self.plots[0].sigXRangeChanged.connect(self._xrange_changed)
+            self.plot_layout.addWidget(self._new_plot(name, unit, i, len(names)), 1)
+        self._finish_plots()
+
+    # -- changing channels -------------------------------------------------
+    def _copy_rows(self) -> list[ChannelRow]:
+        return [ChannelRow(dataclasses.replace(r.ch), r.color) for r in self.rows]
+
+    def _channel_edited(self, strip: ChannelStrip, what: str, value):
+        rows = self._copy_rows()
+        setattr(rows[self.rows.index(strip.row)].ch, what, value)
+        self.apply_channels(rows)
+
+    def _channel_removed(self, strip: ChannelStrip):
+        i = self.rows.index(strip.row)
+        self.apply_channels([r for j, r in enumerate(self._copy_rows()) if j != i])
+
+    def add_channel(self) -> bool:
+        used = {r.ch.physical for r in self.rows}
+        free = [p for p in valid_inputs(self.cfg) if p not in used]
+        if not free:
+            self._channel_message("All inputs are already in use.")
+            return False
+        names = {r.ch.name for r in self.rows}
+        n = len(self.rows) + 1
+        while f"Ch{n}" in names:
+            n += 1
+        color = max([r.color for r in self.rows] + [-1]) + 1
+        return self.apply_channels(self._copy_rows() + [ChannelRow(Channel(free[0], f"Ch{n}"), color)])
+
+    @staticmethod
+    def _layout(channels: list[Channel]) -> list[tuple]:
+        return [(c.physical, c.name, c.units) for c in channels]
+
+    def apply_channels(self, rows: list[ChannelRow]) -> bool:
+        """Switch to a new channel setup. Restarts acquisition if it was running.
+
+        Refused while recording. If the session already has blocks with a
+        different setup, a new session is started, because every block in a
+        session must have the same channels to export as one .mat file.
+        """
+        def refuse(msg):
+            self._channel_message(msg)
+            self._build_live_plots()   # put the controls back as they were
+            return False
+
+        if self.recorder.recording:
+            return refuse("Stop recording before changing channels.")
+        if self.mode != LIVE:
+            return refuse("Go back to live mode to change channels.")
+        trial = self.cfg.with_channels([r.ch for r in rows])
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                cfgmod.validate(trial)
+        except ValueError as e:
+            return refuse(str(e))
+
+        running = self.btn_run.isChecked()
+        hardware_changed = ([(c.physical, c.enabled) for c in trial.channels]
+                            != [(c.physical, c.enabled) for c in self.cfg.channels])
+        if self.blocks and self._layout(trial.channels) != self._layout(self.cfg.channels):
+            if not self._confirm_new_session_for_channels():
+                return refuse("Channels unchanged.")
+            if not self.new_session():          # asks Save / Don't Save if unsaved
+                return refuse("Channels unchanged.")
+        if running and hardware_changed:
+            self.btn_run.setChecked(False)
+
+        self.rows = rows
+        self.cfg.channels, self.cfg.spare_channels = trial.channels, trial.spare_channels
+        if hardware_changed:
+            self.buf_t = np.empty(0)
+            self.buf_y = np.empty((len(self.cfg.channels), 0))
+            self._alloc_buffers()
+        self._build_live_plots()
+        self._redraw_live()
+        if running and hardware_changed and not self.btn_run.isChecked():
+            self.btn_run.setChecked(True)
+        on = ", ".join(f"{c.name} = {c.physical}" for c in self.cfg.channels)
+        self.statusBar().showMessage(f"Channels: {on}", 8000)
+        return True
+
+    def _confirm_new_session_for_channels(self) -> bool:
+        B = QtWidgets.QMessageBox.StandardButton
+        r = QtWidgets.QMessageBox.question(
+            self, "Channels changed",
+            "This session's blocks were recorded with the old channels. All blocks in a session "
+            "must have the same channels, so changing them starts a new session.\n\nContinue?",
+            B.Ok | B.Cancel, B.Ok)
+        return r == B.Ok
+
+    def _channel_message(self, text: str):
+        self.statusBar().showMessage(f"⚠ {text}", 10000)
+
+    def save_setup_dialog(self):
+        if self.config_path:
+            default = self.config_path.with_name(self.config_path.stem + "_setup.toml")
+        else:
+            default = Path(self._start_dir()) / "channel_setup.toml"
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(self, "Save channel setup", str(default),
+                                                        "Config file (*.toml)")
+        if path:
+            cfgmod.save(self.cfg, path)
+            self.statusBar().showMessage(f"Channel setup saved to {path}. "
+                                         f"Start with: neusci-daq -c \"{path}\"", 15000)
 
     def _alloc_buffers(self):
         n = len(self.cfg.channels)
@@ -162,6 +345,7 @@ class MainWindow(QtWidgets.QMainWindow):
         for a in self._review_actions:
             a.setVisible(mode == REVIEW)
         self.scroll.setVisible(mode == REVIEW)
+        self.channel_bar.setVisible(mode == LIVE)
         self._update_title()
 
     def _update_title(self):
@@ -230,7 +414,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.review_dir, self.review_blocks, self.review_block = None, [], None
         self.session_dir, self.blocks, self._exported_n = None, [], 0
         self.session_saved = False
-        self._build_plots([c.name for c in self.cfg.channels], [c.units for c in self.cfg.channels])
+        self._build_live_plots()
         self._set_mode(LIVE)
         self.status.setText("")
 
@@ -496,8 +680,8 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         self.review_block = blk
         names = [p.getAxis("left").labelText for p in self.plots]
-        if names != blk["channel_names"] or len(self.plots) != len(blk["channel_names"]):
-            self._build_plots(blk["channel_names"], blk["units"])
+        if self.strips or names != blk["channel_names"] or len(self.plots) != len(blk["channel_names"]):
+            self._build_review_plots(blk["channel_names"], blk["units"])
         self._clear_markers()
         for curve, y in zip(self.curves, blk["data"]):
             curve.setData(blk["t"], y)
@@ -547,6 +731,13 @@ class MainWindow(QtWidgets.QMainWindow):
     # ======================================================================
     def _toggle_run(self, on: bool):
         if on:
+            # Drop chunks left over from the previous run; their timestamps
+            # restart from 0, so drawing them would join old and new data.
+            while True:
+                try:
+                    self.display_q.get_nowait()
+                except queue.Empty:
+                    break
             try:
                 self.backend.start()
             except Exception as e:
@@ -579,10 +770,22 @@ class MainWindow(QtWidgets.QMainWindow):
             self._update_title()
             self.statusBar().showMessage(f"Recording {path.name} in {self.session_dir}")
             self.btn_rec.setText("■ Stop recording")
+            self._lock_channels(True)
         else:
             self.recorder.stop()
+            self._lock_channels(False)
             self.statusBar().showMessage(f"Saved {self.recorder.path.name}", 10000)
             self.btn_rec.setText("● Record")
+
+    def _lock_channels(self, locked: bool):
+        for st in self.strips:
+            st.setEnabled(not locked)
+        self.btn_add_ch.setEnabled(not locked)
+
+    def _redraw_live(self):
+        if self.buf_t.size and self.buf_y.shape[0] == len(self.curves):
+            for ch, curve, y in zip(self.cfg.channels, self.curves, self.buf_y):
+                curve.setData(self.buf_t, ch.to_units(y))
 
     def _add_comment(self):
         text = self.comment_edit.text().strip()
@@ -655,12 +858,32 @@ class MainWindow(QtWidgets.QMainWindow):
         self.backend.stop()
         if self.session_saved:
             self._autoexport_live()
+        self.recorder.close()   # end the writer thread before Qt and h5py shut down
         super().closeEvent(ev)
 
 
-def run(cfg: Config):
+ICON_DIR = Path(__file__).with_name("icons")
+
+
+def app_icon() -> QtGui.QIcon:
+    """The app's icon, in several sizes so it stays sharp from taskbar to title bar."""
+    icon = QtGui.QIcon()
+    for size in (16, 24, 32, 48, 64, 128, 256, 512):
+        f = ICON_DIR / f"icon_{size}.png"
+        if f.exists():
+            icon.addFile(str(f), QtCore.QSize(size, size))
+    return icon
+
+
+def run(cfg: Config, config_path: str | Path | None = None):
     app = pg.mkQApp("neusci-daq-visualizer")
-    w = MainWindow(cfg)
-    w.resize(1200, 200 + 180 * len(cfg.channels))
+    # pyqtgraph sets its own icon and Windows taskbar ID in mkQApp; replace both
+    # before the window opens, or the taskbar keeps showing pyqtgraph's icon.
+    if sys.platform == "win32":
+        import ctypes
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("neusci.daq.visualizer")
+    app.setWindowIcon(app_icon())
+    w = MainWindow(cfg, config_path=config_path)
+    w.resize(1300, 200 + 180 * len(cfg.channels))
     w.show()
     return app.exec()

@@ -40,7 +40,7 @@ def test_record_roundtrip(tmp_path):
 def test_rejects_over_aggregate_rate():
     c = make_cfg()
     c.backend, c.sample_rate = "nidaqmx", 60_000
-    with pytest.raises(ValueError, match="aggregate"):
+    with pytest.raises(ValueError, match="limit"):
         config.validate(c)
 
 
@@ -48,7 +48,7 @@ def test_diff_limits_channels():
     c = make_cfg()
     c.backend, c.terminal_config = "nidaqmx", "DIFF"
     c.channels[1].physical = "ai5"
-    with pytest.raises(ValueError, match="ai0-ai3"):
+    with pytest.raises(ValueError, match="ai0–ai3"):
         config.validate(c)
 
 
@@ -64,4 +64,4 @@ def test_example_config_loads():
     with warnings.catch_warnings():
         warnings.simplefilter("error")
         cfg = config.load("config.toml")
-    assert cfg.backend == "nidaqmx" and len(cfg.channels) == 2
+    assert cfg.backend == "nidaqmx" and len(cfg.channels) == 4

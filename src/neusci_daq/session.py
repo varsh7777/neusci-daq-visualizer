@@ -67,6 +67,7 @@ def block_info(path: str | Path) -> dict:
             "start_time": str(a["start_time"]),
             "device": str(a["device"]),
             "backend": str(a["backend"]),
+            "terminal_config": str(a["terminal_config"]) if "terminal_config" in a else None,
         }
 
 
@@ -98,6 +99,9 @@ def append_check(folder: str | Path, cfg: Config) -> tuple[list[str], list[str]]
     if not np.isfinite(fs) or abs(fs - cfg.sample_rate) > _RATE_TOLERANCE * cfg.sample_rate:
         problems.append(f"Sample rate differs: session recorded at {fs:g} Hz, "
                         f"config asks for {cfg.sample_rate:g} Hz.")
+    if info["terminal_config"] and info["terminal_config"] != cfg.terminal_config:
+        problems.append(f"Wiring differs: session recorded in {info['terminal_config']} mode, "
+                        f"config uses {cfg.terminal_config}.")
 
     if not problems:
         for c, s, o in zip(cfg.channels, info["scale"], info["offset"]):
