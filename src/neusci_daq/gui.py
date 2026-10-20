@@ -38,8 +38,9 @@ from pyqtgraph.Qt import QtCore, QtGui, QtWidgets
 
 from . import config as cfgmod
 from . import session
+from . import theme
 from .backends import Backend, make_backend
-from .channels import ChannelRow, ChannelStrip
+from .channels import ChannelRow, ChannelStrip, ColorButton
 from .config import Channel, Config, valid_inputs
 from .export import to_labchart_mat
 from .recorder import Recorder
@@ -68,9 +69,15 @@ class MainWindow(QtWidgets.QMainWindow):
         self.review_dir: Path | None = None
         self.review_blocks: list[Path] = []
         self.review_block: dict | None = None
+        self.review_color_btns: list[ColorButton] = []
+        # "Recolour recorded blocks?" answer remembered for this session: None (ask), True, False.
+        self._recolor_policy: bool | None = None
         # The channel setup the user edits in the strips next to each plot.
-        self.rows = [ChannelRow(c, i) for i, c in enumerate(cfg.channels + cfg.spare_channels)]
+        cfgmod.fill_colors(cfg.channels + cfg.spare_channels)
+        self.rows = [ChannelRow(c) for c in cfg.channels + cfg.spare_channels]
 
+        mode = self.settings.value("plot_theme", theme.DARK)
+        self.plot_mode = mode if mode in theme.THEMES else theme.DARK
         self._build_ui()
         self._build_menu()
         self._build_live_plots()
@@ -115,6 +122,15 @@ class MainWindow(QtWidgets.QMainWindow):
         tb.addWidget(self.window_box)
         self._live_actions.append(tb.addWidget(self.comment_edit))
         self._review_actions.append(tb.addWidget(self.btn_live))
+        spacer = QtWidgets.QWidget()            # in live mode the comment box fills this space
+        spacer.setSizePolicy(QtWidgets.QSizePolicy.Policy.Expanding, QtWidgets.QSizePolicy.Policy.Preferred)
+        self._review_actions.append(tb.addWidget(spacer))
+        self.btn_theme = QtWidgets.QToolButton()
+        self.btn_theme.setAutoRaise(True)
+        self.btn_theme.setIconSize(QtCore.QSize(20, 20))
+        self.btn_theme.clicked.connect(self.toggle_plot_theme)
+        tb.addWidget(self.btn_theme)
+        self._update_theme_button()
 
         central = QtWidgets.QWidget()
         lay = QtWidgets.QVBoxLayout(central)
@@ -125,6 +141,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.plot_layout.setContentsMargins(0, 0, 0, 0)
         self.plot_layout.setSpacing(2)
         self.plots, self.curves, self.strips = [], [], []
+        self.plot_widgets, self.curve_colors = [], []
 
         self.channel_bar = QtWidgets.QWidget()
         cb = QtWidgets.QHBoxLayout(self.channel_bar)
@@ -198,10 +215,12 @@ class MainWindow(QtWidgets.QMainWindow):
                 w.setParent(None)
                 w.deleteLater()
         self.plots, self.curves, self.strips = [], [], []
+        self.plot_widgets, self.curve_colors = [], []
 
-    def _new_plot(self, name: str, unit: str, color: int, n_colors: int) -> pg.PlotWidget:
+    def _new_plot(self, name: str, unit: str, color: str) -> pg.PlotWidget:
         pw = pg.PlotWidget()
         p = pw.getPlotItem()
+        self.plot_widgets.append(pw)
         p.setLabel("left", name, units=unit)
         p.getAxis("left").setWidth(70)   # same width on every plot, so time axes line up
         p.showGrid(x=True, y=True, alpha=0.2)
@@ -213,16 +232,16 @@ class MainWindow(QtWidgets.QMainWindow):
         if self.plots:
             p.setXLink(self.plots[0])
         self.plots.append(p)
-        self.curves.append(p.plot(pen=pg.intColor(color, hues=max(3, n_colors))))
+        self.curves.append(p.plot())
+        self.curve_colors.append(color)
+        self._set_curve_color(len(self.curves) - 1, color)
+        self._style_plot(pw)
         return pw
 
     def _finish_plots(self):
         if self.plots:
             self.plots[-1].setLabel("bottom", "time", units="s")
             self.plots[0].sigXRangeChanged.connect(self._xrange_changed)
-
-    def _n_colors(self) -> int:
-        return max(r.color for r in self.rows) + 1 if self.rows else 3
 
     def _build_live_plots(self):
         """One row per channel: its controls on the left, its plot on the right.
@@ -232,20 +251,19 @@ class MainWindow(QtWidgets.QMainWindow):
         """
         self._clear_plot_area()
         inputs = valid_inputs(self.cfg)
-        n_colors = self._n_colors()
         locked = self.recorder.recording
         for r in self.rows:
             row_w = QtWidgets.QWidget()
             h = QtWidgets.QHBoxLayout(row_w)
             h.setContentsMargins(0, 0, 0, 0)
-            strip = ChannelStrip(r, inputs, n_colors, self.cfg.terminal_config == "DIFF",
-                                 self._channel_edited, self._channel_removed,
+            strip = ChannelStrip(r, inputs, self.cfg.terminal_config == "DIFF",
+                                 self._channel_edited, self._channel_removed, self._channel_recolored,
                                  can_remove=len(self.rows) > 1)
-            strip.setEnabled(not locked)
+            strip.set_locked(locked)
             self.strips.append(strip)
             h.addWidget(strip, 0)
             if r.ch.enabled:
-                h.addWidget(self._new_plot(r.ch.name, r.ch.units, r.color, n_colors), 1)
+                h.addWidget(self._new_plot(r.ch.name, r.ch.units, r.ch.color), 1)
                 self.plot_layout.addWidget(row_w, 1)
             else:
                 off = QtWidgets.QLabel("off")
@@ -257,16 +275,65 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btn_add_ch.setEnabled(not locked)
         self.rate_box.setEnabled(not locked)
 
-    def _build_review_plots(self, names: list[str], units: list[str]):
-        """Plots for a saved session: one per recorded channel, no controls."""
+    def _build_review_plots(self, names: list[str], units: list[str], colors: list[str]):
+        """Plots for a saved session: one per recorded channel, with only a colour bar."""
         self._clear_plot_area()
-        for i, (name, unit) in enumerate(zip(names, units)):
-            self.plot_layout.addWidget(self._new_plot(name, unit, i, len(names)), 1)
+        self.review_color_btns = []
+        for i, (name, unit, color) in enumerate(zip(names, units, colors)):
+            row_w = QtWidgets.QWidget()
+            h = QtWidgets.QHBoxLayout(row_w)
+            h.setContentsMargins(0, 0, 0, 0)
+            btn = ColorButton(color, lambda c, i=i: self.set_review_color(i, c),
+                              tooltip="Change this channel's colour in every block of this session")
+            self.review_color_btns.append(btn)
+            h.addWidget(btn, 0)
+            h.addWidget(self._new_plot(name, unit, color), 1)
+            self.plot_layout.addWidget(row_w, 1)
         self._finish_plots()
+
+    # -- dark / light plots ------------------------------------------------
+    def _set_curve_color(self, k: int, color: str) -> None:
+        """Draw trace k in `color` (adjusted for contrast on the current background)."""
+        self.curve_colors[k] = color
+        self.curves[k].setPen(pg.mkPen(theme.display_color(color, self.plot_mode)))
+
+    def _style_plot(self, pw: pg.PlotWidget) -> None:
+        th = theme.THEMES[self.plot_mode]
+        pw.setBackground(th.background)
+        for name in ("left", "bottom"):
+            ax = pw.getPlotItem().getAxis(name)
+            ax.setPen(th.foreground)
+            ax.setTextPen(th.foreground)
+
+    def _update_theme_button(self) -> None:
+        # Window text colour: black normally, white if the operating system uses a dark window.
+        ink = self.palette().color(QtGui.QPalette.ColorRole.WindowText)
+        self.btn_theme.setIcon(theme.toggle_icon(self.plot_mode, ink))
+        self.btn_theme.setToolTip("Dark plots: click for light plots" if self.plot_mode == theme.DARK
+                                  else "Light plots: click for dark plots")
+
+    def toggle_plot_theme(self) -> None:
+        self.set_plot_theme(theme.LIGHT if self.plot_mode == theme.DARK else theme.DARK)
+
+    def set_plot_theme(self, mode: str) -> None:
+        """Switch plot backgrounds between dark and light. Display only; remembered on this computer."""
+        self.plot_mode = mode
+        self.settings.setValue("plot_theme", mode)
+        for pw in self.plot_widgets:
+            self._style_plot(pw)
+        for k, color in enumerate(self.curve_colors):
+            self._set_curve_color(k, color)
+        mc = theme.THEMES[mode].marker
+        for _, lines in self.markers:
+            for ln in lines:
+                ln.setPen(pg.mkPen(mc, style=QtCore.Qt.PenStyle.DashLine))
+                if getattr(ln, "label", None) is not None:   # only the top plot's line has one
+                    ln.label.setColor(mc)
+        self._update_theme_button()
 
     # -- changing channels -------------------------------------------------
     def _copy_rows(self) -> list[ChannelRow]:
-        return [ChannelRow(dataclasses.replace(r.ch), r.color) for r in self.rows]
+        return [ChannelRow(dataclasses.replace(r.ch)) for r in self.rows]
 
     def _channel_edited(self, strip: ChannelStrip, what: str, value):
         rows = self._copy_rows()
@@ -287,8 +354,88 @@ class MainWindow(QtWidgets.QMainWindow):
         n = len(self.rows) + 1
         while f"Ch{n}" in names:
             n += 1
-        color = max([r.color for r in self.rows] + [-1]) + 1
-        return self.apply_channels(self._copy_rows() + [ChannelRow(Channel(free[0], f"Ch{n}"), color)])
+        color = cfgmod.next_color(r.ch.color for r in self.rows)
+        return self.apply_channels(self._copy_rows() + [ChannelRow(Channel(free[0], f"Ch{n}", color=color))])
+
+    # -- colours (display only: allowed while recording, never restarts) ----
+    def _channel_recolored(self, strip: ChannelStrip, color: str):
+        self.set_channel_color(self.rows.index(strip.row), color)
+
+    def set_channel_color(self, index: int, color: str, recolor_recorded: bool | None = None) -> None:
+        """Change a live channel's trace colour.
+
+        If the session already has recorded blocks with a different colour for
+        this channel, asks whether to recolour them too (or uses
+        `recolor_recorded` if given). The block being recorded always follows.
+        """
+        color = cfgmod.normalize_color(color)
+        ch = self.rows[index].ch
+        ch.color = color
+        strip = self.strips[index] if index < len(self.strips) else None
+        if strip is not None:
+            strip.color_btn.set_color(color, ch.enabled)
+        if ch in self.cfg.channels:
+            k = self.cfg.channels.index(ch)
+            if k < len(self.curves):
+                self._set_curve_color(k, color)
+        if self.recorder.recording:
+            self.recorder.set_colors([c.color for c in self.cfg.channels])
+        current = self.recorder.path if self.recorder.recording else None
+        older = [b for b in self.blocks if b != current and self._block_color(b, ch.name) not in (None, color)]
+        if older:
+            if recolor_recorded is None:
+                recolor_recorded = self._recolor_policy
+            if recolor_recorded is None:
+                recolor_recorded, remember = self._ask_recolor(ch.name, len(older))
+                if remember:
+                    self._recolor_policy = recolor_recorded
+            if recolor_recorded:
+                self._recolor(older, {ch.name: color})
+                return
+        self.statusBar().showMessage(f"{ch.name}: colour {cfgmod.color_label(color)}", 6000)
+
+    @staticmethod
+    def _block_color(block: Path, name: str) -> str | None:
+        """Colour of channel `name` in a recorded block, or None if it isn't there."""
+        try:
+            info = session.block_info(block)
+        except Exception:
+            return None
+        names = info["channel_names"]
+        return info["colors"][names.index(name)] if name in names else None
+
+    def _ask_recolor(self, name: str, n: int) -> tuple[bool, bool]:
+        """Ask whether to recolour recorded blocks. Returns (recolour, remember for this session)."""
+        B = QtWidgets.QMessageBox.StandardButton
+        box = QtWidgets.QMessageBox(
+            QtWidgets.QMessageBox.Icon.Question, "Recolour recorded blocks?",
+            f"{n} block(s) already recorded in this session show {name} in another colour.\n\n"
+            "Use the new colour for them too? (Only the display colour changes, not the data.)",
+            B.Yes | B.No, self)
+        box.setDefaultButton(B.Yes)
+        remember = QtWidgets.QCheckBox("Do this for every colour change in this session")
+        box.setCheckBox(remember)
+        return box.exec() == B.Yes, remember.isChecked()
+
+    def _recolor(self, blocks: list[Path], colors: dict[str, str]) -> None:
+        failed = session.recolor_blocks(blocks, colors)
+        names = ", ".join(colors)
+        if failed:
+            self._channel_message(f"Couldn't update the colour in {len(failed)} block(s) "
+                                  f"(read-only or in use?): {', '.join(f.name for f in failed)}")
+        else:
+            self.statusBar().showMessage(f"{names}: colour updated in {len(blocks)} recorded block(s)", 8000)
+
+    def set_review_color(self, index: int, color: str) -> None:
+        """Recolour one channel in every block of the session being reviewed."""
+        if self.mode != REVIEW or self.review_block is None:
+            return
+        color = cfgmod.normalize_color(color)
+        name = self.review_block["channel_names"][index]
+        self.review_block["colors"][index] = color
+        self._set_curve_color(index, color)
+        self.review_color_btns[index].set_color(color)
+        self._recolor(self.review_blocks, {name: color})
 
     @staticmethod
     def _layout(channels: list[Channel]) -> list[tuple]:
@@ -545,6 +692,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.review_dir, self.review_blocks, self.review_block = None, [], None
         self.session_dir, self.blocks, self._exported_n = None, [], 0
         self.session_saved = False
+        self._recolor_policy = None          # a new session asks again
         self._build_live_plots()
         self._set_mode(LIVE)
         self.status.setText("")
@@ -606,7 +754,41 @@ class MainWindow(QtWidgets.QMainWindow):
                 self, "Append anyway?", "\n".join(warnings) + "\n\nAppend with the new settings?")
             if ok != QtWidgets.QMessageBox.StandardButton.Yes:
                 return
+        if not self._confirm_append(Path(path)):
+            return
         self._try(lambda: self.append_session(path, force=True), "Could not append")
+
+    def _append_notes(self, path: Path) -> list[str]:
+        """What happens on Append, including colours that will change."""
+        notes = [
+            "New blocks must use the same channel names, inputs, units, sampling rate and "
+            "wiring as the blocks already in this session. (They do now; if you change any of "
+            "them after appending, a new session is started instead.)",
+            "Channels are matched by name, so don't rename a channel while appending.",
+        ]
+        used = session.session_colors(path)
+        changed = [f"{r.ch.name} → {cfgmod.color_label(used[r.ch.name])}" for r in self.rows
+                   if r.ch.name in used and used[r.ch.name] != r.ch.color]
+        if changed:
+            notes.append("To match the session, these channels will switch colour: " + ", ".join(changed) + ".")
+        return notes
+
+    def _confirm_append(self, path: Path) -> bool:
+        """Explain the rules for appending before doing it (can be turned off)."""
+        if self.settings.value("skip_append_notice", False, type=bool):
+            return True
+        B = QtWidgets.QMessageBox.StandardButton
+        box = QtWidgets.QMessageBox(
+            QtWidgets.QMessageBox.Icon.Information, "Append to session",
+            f"Appending to {path.name}.\n\n• " + "\n• ".join(self._append_notes(path)),
+            B.Ok | B.Cancel, self)
+        box.setDefaultButton(B.Ok)
+        skip = QtWidgets.QCheckBox("Don't show this again")
+        box.setCheckBox(skip)
+        ok = box.exec() == B.Ok
+        if ok and skip.isChecked():
+            self.settings.setValue("skip_append_notice", True)
+        return ok
 
     def export_dialog(self):
         blocks, folder = self._export_blocks(), self._export_folder()
@@ -723,6 +905,12 @@ class MainWindow(QtWidgets.QMainWindow):
         if problems or (warnings and not force):
             raise session.SessionError("\n".join(problems + warnings))
         self.back_to_live()
+        # New blocks match the colours already used in this session.
+        used = session.session_colors(path)
+        for r in self.rows:
+            if r.ch.name in used:
+                r.ch.color = used[r.ch.name]
+        self._build_live_plots()
         self.session_dir = path
         self.session_saved = True
         self.blocks = session.list_blocks(path)
@@ -812,7 +1000,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self.review_block = blk
         names = [p.getAxis("left").labelText for p in self.plots]
         if self.strips or names != blk["channel_names"] or len(self.plots) != len(blk["channel_names"]):
-            self._build_review_plots(blk["channel_names"], blk["units"])
+            self._build_review_plots(blk["channel_names"], blk["units"], blk["colors"])
+        for k, (btn, color) in enumerate(zip(self.review_color_btns, blk["colors"])):
+            if k < len(self.curves):
+                self._set_curve_color(k, color)
+            btn.set_color(color)
         self._clear_markers()
         for curve, y in zip(self.curves, blk["data"]):
             curve.setData(blk["t"], y)
@@ -911,7 +1103,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _lock_channels(self, locked: bool):
         for st in self.strips:
-            st.setEnabled(not locked)
+            st.set_locked(locked)
         self.btn_add_ch.setEnabled(not locked)
         self.rate_box.setEnabled(not locked)
         self.wiring_menu.setEnabled(not locked and self.mode == LIVE)
@@ -932,9 +1124,10 @@ class MainWindow(QtWidgets.QMainWindow):
     def _add_marker(self, t: float, text: str):
         lines = []
         for p in self.plots:
-            ln = pg.InfiniteLine(t, angle=90, pen=pg.mkPen("y", style=QtCore.Qt.PenStyle.DashLine),
+            mc = theme.THEMES[self.plot_mode].marker
+            ln = pg.InfiniteLine(t, angle=90, pen=pg.mkPen(mc, style=QtCore.Qt.PenStyle.DashLine),
                                  label=text if p is self.plots[0] else None,
-                                 labelOpts={"position": 0.9, "color": "y"})
+                                 labelOpts={"position": 0.9, "color": mc})
             p.addItem(ln)
             lines.append(ln)
         self.markers.append((t, lines))

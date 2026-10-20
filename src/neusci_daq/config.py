@@ -18,6 +18,51 @@ RATE_PRESETS = (100, 200, 500, 1000, 2000, 5000, 10000, 20000, 25000, 50000, 100
 READ_INTERVAL_S = 0.05
 
 
+# Trace colours, in the order new channels get them. Based on the Okabe-Ito
+# colour-blind-safe palette, ordered so the first few are bright on black.
+PALETTE = ("#E69F00", "#56B4E9", "#009E73", "#F0E442",
+           "#D55E00", "#CC79A7", "#FFFFFF", "#3D8FD1")
+PALETTE_NAMES = ("Orange", "Sky blue", "Green", "Yellow", "Red-orange", "Pink", "White", "Blue")
+
+
+def normalize_color(c: str) -> str:
+    """'#abc', 'abcdef' or '#ABCDEF' -> '#abcdef'. Raises ValueError otherwise."""
+    h = c.strip().lstrip("#")
+    if len(h) == 3:
+        h = "".join(ch * 2 for ch in h)
+    if len(h) != 6 or any(ch not in "0123456789abcdefABCDEF" for ch in h):
+        raise ValueError(f"{c!r} isn't a colour; use #rrggbb, e.g. #e69f00.")
+    return "#" + h.lower()
+
+
+def color_label(c: str) -> str:
+    """'Orange' for palette colours, otherwise the hex code, for messages."""
+    c = normalize_color(c)
+    for p, name in zip(PALETTE, PALETTE_NAMES):
+        if normalize_color(p) == c:
+            return name.lower()
+    return c
+
+
+def next_color(used) -> str:
+    """First palette colour not already used; cycles once all are taken."""
+    used = {normalize_color(u) for u in used if u}
+    for c in PALETTE:
+        if normalize_color(c) not in used:
+            return normalize_color(c)
+    return normalize_color(PALETTE[len(used) % len(PALETTE)])
+
+
+def fill_colors(channels) -> None:
+    """Give every channel without a colour the next unused palette colour, in order."""
+    for ch in channels:
+        if ch.color:
+            ch.color = normalize_color(ch.color)
+    for ch in channels:
+        if not ch.color:
+            ch.color = next_color(c.color for c in channels)
+
+
 def auto_chunk_size(rate: float) -> int:
     """Samples per channel per read for ~50 ms display latency at `rate`."""
     return max(1, round(rate * READ_INTERVAL_S))
@@ -37,6 +82,7 @@ class Channel:
     offset: float = 0.0
     range: tuple[float, float] = USB6003_RANGE
     enabled: bool = True
+    color: str = ""               # "#rrggbb"; empty = next palette colour
 
     def to_units(self, volts):
         return volts * self.scale + self.offset
@@ -79,6 +125,7 @@ def load(path: str | Path) -> Config:
             ch.range = tuple(c["range"])
         ch.name = ch.name or ch.physical
         chans.append(ch)
+    fill_colors(chans)
     cfg = Config(
         backend=dev.get("backend", "nidaqmx"),
         device=dev.get("device", "Dev1"),
@@ -166,6 +213,8 @@ def dumps(cfg: Config) -> str:
             lines.append(f"offset = {c.offset:g}")
         if tuple(c.range) != USB6003_RANGE:
             lines.append(f"range = [{c.range[0]:g}, {c.range[1]:g}]")
+        if c.color:
+            lines.append(f"color = {_s(c.color)}")
         if not c.enabled:
             lines.append("enabled = false")
     return "\n".join(lines) + "\n"

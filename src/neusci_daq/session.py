@@ -13,7 +13,7 @@ from pathlib import Path
 import h5py
 import numpy as np
 
-from .config import Config
+from .config import Config, PALETTE, normalize_color
 
 _BLOCK_RE = re.compile(r"block_(\d+)\.h5")
 # Device-coerced rates differ slightly from the requested rate.
@@ -48,6 +48,18 @@ def next_block_path(folder: str | Path) -> Path:
     return Path(folder) / f"block_{(max(nums) if nums else 0) + 1:03d}.h5"
 
 
+def _colors(attrs, n: int) -> list[str]:
+    """Saved trace colours, or palette colours for blocks recorded before colours were saved."""
+    saved = [str(c) for c in attrs["colors"]] if "colors" in attrs else []
+    out = []
+    for i in range(n):
+        try:
+            out.append(normalize_color(saved[i]))
+        except (IndexError, ValueError):
+            out.append(normalize_color(PALETTE[i % len(PALETTE)]))
+    return out
+
+
 def block_info(path: str | Path) -> dict:
     """Metadata of one block, without loading its data."""
     with h5py.File(path, "r") as f:
@@ -60,6 +72,7 @@ def block_info(path: str | Path) -> dict:
             "units": [str(x) for x in a["units"]],
             "scale": [float(x) for x in a["scale"]],
             "offset": [float(x) for x in a["offset"]],
+            "colors": _colors(a, len(a["channel_names"])),
             "sample_rate": fs,
             "n_samples": int(n),
             "duration_s": n / fs if fs > 0 else float("nan"),
@@ -130,9 +143,39 @@ def read_block(path: str | Path) -> dict:
             "t": t, "data": data, "comments": comments, "sample_rate": fs,
             "channel_names": [str(x) for x in a["channel_names"]],
             "units": [str(x) for x in a["units"]],
+            "colors": _colors(a, len(a["channel_names"])),
             "terminal_config": str(a["terminal_config"]) if "terminal_config" in a else None,
             "duration_s": float(t[-1]) if t.size else 0.0,
         }
+
+
+def session_colors(folder: str | Path) -> dict[str, str]:
+    """Channel name -> colour, as last used in this session (later blocks win)."""
+    out: dict[str, str] = {}
+    for b in list_blocks(folder):
+        try:
+            info = block_info(b)
+        except Exception:
+            continue
+        out.update(zip(info["channel_names"], info["colors"]))
+    return out
+
+
+def recolor_blocks(blocks, colors: dict[str, str]) -> list[Path]:
+    """Set the colour of channels (by name) in recorded blocks. Only metadata is
+    changed, never the data. Returns the blocks that couldn't be updated."""
+    failed = []
+    for b in blocks:
+        try:
+            with h5py.File(b, "r+") as f:
+                names = [str(x) for x in f.attrs["channel_names"]]
+                cur = _colors(f.attrs, len(names))
+                new = [normalize_color(colors[n]) if n in colors else c for n, c in zip(names, cur)]
+                if new != cur or "colors" not in f.attrs:
+                    f.attrs["colors"] = new
+        except Exception:
+            failed.append(Path(b))
+    return failed
 
 
 def add_recent(recent: list[str], path: str | Path, limit: int = 8) -> list[str]:

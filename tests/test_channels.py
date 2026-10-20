@@ -114,11 +114,13 @@ def test_channels_locked_while_recording(win, app):
     pump(app, 0.2)
     win.btn_rec.setChecked(True)
     pump(app, 0.2)
-    assert not any(s.isEnabled() for s in win.strips) and not win.btn_add_ch.isEnabled()
+    # Everything is locked except the colour, which is display-only.
+    assert not any(w.isEnabled() for s in win.strips for w in (s.on, s.name, s.input, s.remove))
+    assert all(s.color_btn.isEnabled() for s in win.strips) and not win.btn_add_ch.isEnabled()
     assert not edit(win, 1, "physical", "ai2")
     assert [c.physical for c in win.cfg.channels] == ["ai0", "ai1"]
     win.btn_rec.setChecked(False)
-    assert all(s.isEnabled() for s in win.strips)
+    assert all(w.isEnabled() for s in win.strips for w in (s.on, s.name, s.input, s.remove))
     win.btn_run.setChecked(False)
 
 

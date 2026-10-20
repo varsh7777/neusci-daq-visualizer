@@ -5,7 +5,8 @@ File layout:
   /t           (N,) float64              -- only for software-timed backends
   /comments    compound(t, sample_index, text)
   attrs: sample_rate, hardware_timed, device, backend, start_time,
-         channel_names, physical, units, scale, offset
+         channel_names, physical, units, scale, offset, colors
+         (colors are display-only and may be changed later)
 """
 from __future__ import annotations
 
@@ -64,6 +65,7 @@ class Recorder:
         a["units"] = [c.units for c in cfg.channels]
         a["scale"] = [c.scale for c in cfg.channels]
         a["offset"] = [c.offset for c in cfg.channels]
+        a["colors"] = [c.color for c in cfg.channels]
         with self._lock:
             self.samples_written = 0
             self._t_offset = None
@@ -83,6 +85,13 @@ class Recorder:
                     self._file.attrs["sample_rate"] = self.backend.actual_rate
                 self._file.close()
                 self._file = None
+
+    def set_colors(self, colors: list[str]) -> None:
+        """Update the colours of the block being recorded (display metadata only)."""
+        with self._lock:
+            if self._file is not None:
+                self._file.attrs["colors"] = list(colors)
+                self._file.flush()
 
     def add_comment(self, text: str) -> float:
         """Comment at the latest acquired sample. Returns its stream time (s)."""
