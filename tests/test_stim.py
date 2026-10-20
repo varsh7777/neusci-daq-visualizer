@@ -246,12 +246,12 @@ def test_repeat_fires_until_stopped(app, win):
     win.set_stimulus(Stimulus(amplitude_v=1, width_ms=1))
     win.btn_run.setChecked(True)
     pump(app, 0.2)
-    win.act_repeat.setChecked(True)
+    win.stim_page.btn_repeat.click()                       # the Repeat button on the tab
     pump(app, 0.55)
     n = win.stim_out.fired
     assert n >= 3
     win.btn_run.setChecked(False)                          # Stop also stops repeating
-    assert not win.act_repeat.isChecked()
+    assert not win.repeating and not win.stim_page.btn_repeat.isChecked()
     pump(app, 0.3)
     assert win.stim_out.fired == n
 
@@ -259,7 +259,7 @@ def test_repeat_fires_until_stopped(app, win):
 def test_output_choice_and_stimulus_are_remembered(win, tmp_path):
     from neusci_daq.gui import MainWindow
     win.set_stim_output("ao1")
-    assert win.cfg.stim_output == "ao1" and win.act_stim_out["ao1"].isChecked()
+    assert win.cfg.stim_output == "ao1" and win.stim_page.output.currentText() == "ao1"
     win.set_stimulus(Stimulus(shape="ramp", end_v=2))
     w2 = MainWindow(make_cfg(tmp_path), settings=win.settings)
     assert w2.stimulus.shape == "ramp" and w2.stimulus.end_v == 2

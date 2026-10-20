@@ -73,13 +73,25 @@ class ColorButton(QtWidgets.QToolButton):
             QtCore.QTimer.singleShot(0, lambda: self._on_pick(c))
 
 
+COMPACT_WIDTH = 54
+LINE_MIN, LINE_MAX = 0.5, 20.0
+
+
 class ChannelStrip(QtWidgets.QFrame):
-    """On/off, name, input, colour and remove controls for one channel."""
+    """On/off, name, input, line thickness, colour and remove controls for one channel.
+
+    In split view the strip is compact (colour bar and name) and shows its full
+    controls while the mouse is over it, or while you're editing one of them.
+    """
+
+    hover_changed = QtCore.Signal(bool)
 
     def __init__(self, row: ChannelRow, inputs: list[str], diff: bool,
-                 on_change, on_remove, on_color, can_remove: bool):
+                 on_change, on_remove, on_color, can_remove: bool, on_width=None):
         super().__init__()
         self.row = row
+        self.setObjectName("channelStrip")
+        self.setAttribute(QtCore.Qt.WidgetAttribute.WA_StyledBackground, True)
         self.setFixedWidth(STRIP_WIDTH)
         outer = QtWidgets.QHBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
@@ -88,9 +100,16 @@ class ChannelStrip(QtWidgets.QFrame):
         self.color_btn = ColorButton(row.ch.color, lambda c: on_color(self, c),
                                      enabled_look=row.ch.enabled)
         outer.addWidget(self.color_btn)
-        body = QtWidgets.QWidget()
-        outer.addWidget(body, 1)
-        lay = QtWidgets.QGridLayout(body)
+        # Compact view: just the name.
+        self.mini = QtWidgets.QLabel(row.ch.name)
+        self.mini.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+        self.mini.setWordWrap(True)
+        self.mini.setToolTip("Point at this to show the channel's controls")
+        self.mini.hide()
+        outer.addWidget(self.mini, 1)
+        self.body = QtWidgets.QWidget()
+        outer.addWidget(self.body, 1)
+        lay = QtWidgets.QGridLayout(self.body)
         lay.setContentsMargins(10, 6, 6, 6)
         lay.setVerticalSpacing(6)
 
@@ -112,17 +131,25 @@ class ChannelStrip(QtWidgets.QFrame):
         self.remove.setToolTip("Remove this channel")
         self._can_remove = can_remove
         self.remove.setEnabled(can_remove)
+        # Line thickness: typed, 0.5-20 px. Display only, so it works while recording.
+        self.line_width = QtWidgets.QDoubleSpinBox(minimum=LINE_MIN, maximum=LINE_MAX, decimals=1, singleStep=0.5)
+        self.line_width.setSuffix(" px")
+        self.line_width.setValue(float(getattr(row.ch, "width", 1.0)))
+        self.line_width.setKeyboardTracking(False)
+        self.line_width.setToolTip(f"Line thickness ({LINE_MIN:g}–{LINE_MAX:g} px)")
 
         lay.addWidget(self.on, 0, 0)
         lay.addWidget(self.name, 0, 1, 1, 2)
         lay.addWidget(QtWidgets.QLabel("Input"), 1, 0, 1, 1)
         lay.addWidget(self.input, 1, 1)
         lay.addWidget(self.remove, 1, 2)
+        lay.addWidget(QtWidgets.QLabel("Line"), 2, 0, 1, 1)
+        lay.addWidget(self.line_width, 2, 1)
         info = QtWidgets.QLabel(f"{row.ch.units} · scale ×{row.ch.scale:g}")
         info.setToolTip("Units and scale come from the config file")
         info.setStyleSheet("color: gray")
-        lay.addWidget(info, 2, 1, 1, 2)
-        lay.setRowStretch(3, 1)
+        lay.addWidget(info, 3, 1, 1, 2)
+        lay.setRowStretch(4, 1)
 
         # Defer: the strip is rebuilt after a change, and must not be deleted
         # while its own signal is still running.
@@ -132,9 +159,88 @@ class ChannelStrip(QtWidgets.QFrame):
         self.name.editingFinished.connect(later(lambda: self.name.text().strip() != row.ch.name
                                                 and on_change(self, "name", self.name.text().strip())))
         self.remove.clicked.connect(later(lambda: on_remove(self)))
+        if on_width is not None:
+            self.line_width.valueChanged.connect(lambda v: on_width(self, float(v)))
+
+        self.compact = False
+        self.expanded = True
+        self._collapse_timer = QtCore.QTimer(self, interval=250, timeout=self._maybe_collapse)
 
     def set_locked(self, locked: bool) -> None:
-        """While recording, lock everything except the colour."""
+        """While recording, lock everything except the colour and line thickness."""
         for w in (self.on, self.name, self.input):
             w.setEnabled(not locked)
         self.remove.setEnabled(self._can_remove and not locked)
+
+    # -- compact (split view) ----------------------------------------------------
+    def set_compact(self, compact: bool) -> None:
+        self.compact = compact
+        self._set_expanded(not compact)
+
+    def _set_expanded(self, on: bool) -> None:
+        self.expanded = on
+        self.body.setVisible(on)
+        self.mini.setVisible(not on)
+        self.setFixedWidth(STRIP_WIDTH if on else COMPACT_WIDTH)
+        if self.compact and on:
+            self._collapse_timer.start()
+        else:
+            self._collapse_timer.stop()
+        self.hover_changed.emit(on)
+
+    def enterEvent(self, ev):
+        if self.compact and not self.expanded:
+            self._set_expanded(True)
+        super().enterEvent(ev)
+
+    def _busy(self) -> bool:
+        """Still in use: under the mouse, editing a field, or a drop-down is open."""
+        if self.underMouse():
+            return True
+        fw = QtWidgets.QApplication.focusWidget()
+        if fw is not None and (fw is self or self.isAncestorOf(fw)) and fw is not self.color_btn:
+            return True
+        popup = QtWidgets.QApplication.activePopupWidget()
+        return popup is not None
+
+    def _maybe_collapse(self):
+        if self.compact and self.expanded and not self._busy():
+            self._set_expanded(False)
+
+
+class ChannelRowWidget(QtWidgets.QWidget):
+    """One channel row: its strip and its plot (or an "off" label).
+
+    In split view the strip is compact, and when it expands it slides over the
+    plot instead of squeezing it, so the trace doesn't jump.
+    """
+
+    def __init__(self, strip: ChannelStrip, content: QtWidgets.QWidget):
+        super().__init__()
+        self.strip, self.content = strip, content
+        strip.setParent(self)
+        content.setParent(self)
+        strip.raise_()
+        strip.hover_changed.connect(lambda _: self._relayout())
+
+    def set_compact(self, compact: bool) -> None:
+        self.strip.set_compact(compact)
+        self._relayout()
+
+    def sizeHint(self):
+        s = self.content.sizeHint()
+        return QtCore.QSize(STRIP_WIDTH + s.width(), max(s.height(), self.strip.sizeHint().height()))
+
+    def minimumSizeHint(self):
+        return QtCore.QSize(COMPACT_WIDTH + 50, self.strip.minimumSizeHint().height())
+
+    def resizeEvent(self, ev):
+        self._relayout()
+        super().resizeEvent(ev)
+
+    def _relayout(self):
+        w, h = self.width(), self.height()
+        left = COMPACT_WIDTH if self.strip.compact else STRIP_WIDTH
+        self.content.setGeometry(left, 0, max(0, w - left), h)
+        self.strip.setGeometry(0, 0, STRIP_WIDTH if self.strip.expanded else COMPACT_WIDTH, h)
+        self.strip.raise_()

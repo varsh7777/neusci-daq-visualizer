@@ -83,6 +83,7 @@ class Channel:
     range: tuple[float, float] = USB6003_RANGE
     enabled: bool = True
     color: str = ""               # "#rrggbb"; empty = next palette colour
+    width: float = 1.0            # trace thickness in px (display only)
 
     def to_units(self, volts):
         return volts * self.scale + self.offset
@@ -181,6 +182,8 @@ def validate(cfg: Config) -> None:
         if ch.physical in seen:
             raise ValueError(f"{seen[ch.physical]} and {ch.name} both use {ch.physical}. "
                              "Each input can only be one channel.")
+        if not 0.5 <= float(ch.width) <= 20:
+            raise ValueError(f"{ch.name}: line width must be between 0.5 and 20 px.")
         if not ch.name.strip():
             raise ValueError("Every channel needs a name.")
         if ch.name in names:
@@ -237,6 +240,8 @@ def dumps(cfg: Config) -> str:
             lines.append(f"range = [{c.range[0]:g}, {c.range[1]:g}]")
         if c.color:
             lines.append(f"color = {_s(c.color)}")
+        if c.width != 1.0:
+            lines.append(f"width = {c.width:g}")
         if not c.enabled:
             lines.append("enabled = false")
     return "\n".join(lines) + "\n"

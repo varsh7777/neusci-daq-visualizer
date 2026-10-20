@@ -1,4 +1,4 @@
-"""The Stimulus window (Stimulator > Stimulus…): design a stimulus, see it, fire it.
+"""The Stimulator tab: design a stimulus, see it, fire it, and choose the output.
 
 Every change applies straight away to the stimulus that Fire and Repeat send,
 so there is no Apply button. The preview shows exactly the samples that will
@@ -12,6 +12,8 @@ import numpy as np
 import pyqtgraph as pg
 from pyqtgraph.Qt import QtCore, QtWidgets
 
+from . import style
+
 from . import stim as stimmod
 from .stim import Stimulus
 
@@ -23,13 +25,12 @@ def _spin(lo, hi, decimals=2, suffix="", step=1.0):
     return s
 
 
-class StimWindow(QtWidgets.QWidget):
+class StimPage(QtWidgets.QWidget):
     def __init__(self, main):
-        super().__init__(main, QtCore.Qt.WindowType.Window)
+        super().__init__()
         self.main = main
-        self.setWindowTitle("Stimulus")
-        self.resize(760, 470)
         self._loading = False
+        self._mode = style.LIGHT
         outer = QtWidgets.QHBoxLayout(self)
         outer.setContentsMargins(14, 14, 14, 14)
         outer.setSpacing(16)
@@ -110,32 +111,48 @@ class StimWindow(QtWidgets.QWidget):
         self.pages.addWidget(fw)
         left.addWidget(self.pages, 1)
 
+        line = QtWidgets.QFrame()
+        line.setFrameShape(QtWidgets.QFrame.Shape.HLine)
+        left.addWidget(line)
         bottom = QtWidgets.QFormLayout()
+        self.output = QtWidgets.QComboBox()
+        self.output.addItems(list(stimmod.AO_CHANNELS))
+        self.output.setToolTip("Which analog output sends the stimulus")
+        self.monitor = QtWidgets.QComboBox()
+        self.monitor.setToolTip("Record the stimulus on a spare input (wire the output to it). "
+                                "This adds a channel named Stim with exact timing.")
         self.repeat = _spin(0.05, 3600, suffix=" s", step=0.5)
-        self.repeat.setToolTip("Stimulator > Repeat fires the stimulus this often")
+        self.repeat.setToolTip("Repeat fires the stimulus this often")
+        bottom.addRow("Output", self.output)
+        bottom.addRow("Record on", self.monitor)
         bottom.addRow("Repeat every", self.repeat)
         left.addLayout(bottom)
         btns = QtWidgets.QHBoxLayout()
         self.btn_fire = QtWidgets.QPushButton("Fire")
         self.btn_fire.setObjectName("start")
+        self.btn_fire.setToolTip("Send the stimulus once (Ctrl+F)")
+        self.btn_repeat = QtWidgets.QPushButton("Repeat", checkable=True)
+        self.btn_repeat.setToolTip("Keep sending it every few seconds until you press Stop")
         self.btn_stop = QtWidgets.QPushButton("Stop")
+        self.btn_stop.setToolTip("Stop the stimulus and set the output to 0 V (Esc)")
         self.btn_save = QtWidgets.QPushButton("Save…")
         self.btn_load = QtWidgets.QPushButton("Load…")
-        for b in (self.btn_fire, self.btn_stop, self.btn_save, self.btn_load):
+        for b in (self.btn_fire, self.btn_repeat, self.btn_stop):
+            btns.addWidget(b)
+        btns.addStretch(1)
+        for b in (self.btn_save, self.btn_load):
             btns.addWidget(b)
         left.addLayout(btns)
         outer.addLayout(left, 0)
 
         # ---- right: preview ----------------------------------------------
         right = QtWidgets.QVBoxLayout()
-        self.preview = pg.PlotWidget(background="#ffffff")
+        self.preview = pg.PlotWidget()
         p = self.preview.getPlotItem()
         p.setLabel("left", "Output", units="V")
         p.setLabel("bottom", "time", units="s")
         p.showGrid(x=True, y=True, alpha=0.25)
-        for ax in ("left", "bottom"):
-            p.getAxis(ax).setPen("#303030"); p.getAxis(ax).setTextPen("#303030")
-        self.curve = p.plot(pen=pg.mkPen("#1a5fd0", width=2), stepMode=None)
+        self.curve = p.plot(stepMode=None)
         right.addWidget(self.preview, 1)
         self.info = QtWidgets.QLabel()
         self.info.setWordWrap(True)
@@ -161,8 +178,13 @@ class StimWindow(QtWidgets.QWidget):
         self.btn_del_seg.clicked.connect(self._remove_segment)
         self.btn_browse.clicked.connect(self._browse)
         self.repeat.valueChanged.connect(lambda v: setattr(self.main, "stim_repeat_s", float(v)))
-        self.btn_fire.clicked.connect(self.main.fire_stimulus)
+        self.btn_fire.clicked.connect(lambda: self.main.fire_stimulus())
+        self.btn_repeat.toggled.connect(self.main.set_repeat)
         self.btn_stop.clicked.connect(self.main.stop_stimulus)
+        self.output.activated.connect(lambda *_: self.main.set_stim_output(self.output.currentText()))
+        self.monitor.activated.connect(lambda *_: self._monitor_picked())
+        self.sync()
+        self.apply_theme(style.LIGHT)
         self.btn_save.clicked.connect(self._save)
         self.btn_load.clicked.connect(self._load)
         self._update_preview()
@@ -231,7 +253,7 @@ class StimWindow(QtWidgets.QWidget):
         except ValueError as e:
             self._show_problem(str(e))
             return
-        self.main.set_stimulus(s)
+        self.main._stimulus_edited(s)
         self._update_preview()
 
     def _update_preview(self):
@@ -254,12 +276,48 @@ class StimWindow(QtWidgets.QWidget):
                           f"{len(wave):,} samples" + ("".join("\n" + n for n in notes)))
 
     def _show_problem(self, text: str):
-        self.message.setStyleSheet("color: #b42318")
-        self.message.setText(text)
+        self.show_message(text, error=True)
 
     def show_message(self, text: str, error: bool = False):
-        self.message.setStyleSheet("color: #b42318" if error else "color: #4a5058")
+        t = style.tokens(self._mode)
+        self.message.setStyleSheet(f"color: {t['error'] if error else t['muted']}")
         self.message.setText(text)
+
+    # -- output, monitor, repeat (owned by the main window) --------------------
+    def sync(self) -> None:
+        """Show the main window's current output, monitor input and repeat state."""
+        cfg = self.main.cfg
+        self.output.setCurrentText(cfg.stim_output)
+        self.monitor.blockSignals(True)
+        self.monitor.clear()
+        for label, phys, enabled, tip in self.main.monitor_choices():
+            self.monitor.addItem(label, phys)
+            i = self.monitor.count() - 1
+            self.monitor.setItemData(i, tip, QtCore.Qt.ItemDataRole.ToolTipRole)
+            if not enabled:
+                self.monitor.model().item(i).setEnabled(False)
+        self.monitor.setCurrentIndex(max(0, self.monitor.findData(cfg.stim_monitor)))
+        self.monitor.blockSignals(False)
+        self.btn_repeat.blockSignals(True)
+        self.btn_repeat.setChecked(self.main.repeating)
+        self.btn_repeat.blockSignals(False)
+        self._update_preview()
+
+    def _monitor_picked(self):
+        phys = self.monitor.currentData() or ""
+        self.main.set_stim_monitor(phys)
+        self.sync()
+
+    def apply_theme(self, mode: str) -> None:
+        from . import theme
+        self._mode = mode
+        th = theme.THEMES[theme.DARK if mode == style.DARK else theme.LIGHT]
+        self.preview.setBackground(th.background)
+        for ax in ("left", "bottom"):
+            self.preview.getPlotItem().getAxis(ax).setPen(th.foreground)
+            self.preview.getPlotItem().getAxis(ax).setTextPen(th.foreground)
+        self.curve.setPen(pg.mkPen("#4d8dff" if mode == style.DARK else "#1a5fd0", width=2))
+        self._update_preview()
 
     # -- custom segments -----------------------------------------------------
     def _append_row(self, dur, start, end):
@@ -310,3 +368,6 @@ class StimWindow(QtWidgets.QWidget):
             self.show_message(str(e), error=True)
             return
         self.set_stimulus(s)
+
+
+StimWindow = StimPage   # older name

@@ -55,12 +55,12 @@ class CommentsPanel(QtWidgets.QWidget):
             sc.activated.connect(self._delete_selected)
         lay.addWidget(self.tree, 1)
         self.empty = QtWidgets.QLabel("No comments in this block")
-        self.empty.setStyleSheet("color: #5c6370")
         lay.addWidget(self.empty)
         lay.addStretch(0)
         self._filling = False
         self._texts: list[str] = []
         self.editable = True
+        self.link_color = "#1a5fb4"      # set by the window for light/dark mode
 
     # -- filling -------------------------------------------------------
     def set_comments(self, title: str, comments: list[tuple[float, str]], editable: bool = True) -> None:
@@ -71,7 +71,7 @@ class CommentsPanel(QtWidgets.QWidget):
         self._texts = [text for _, text in comments]
         for t, text in comments:
             it = QtWidgets.QTreeWidgetItem([f"{t:.1f} s", text])
-            it.setForeground(0, QtGui.QBrush(QtGui.QColor("#1a5fb4")))
+            it.setForeground(0, QtGui.QBrush(QtGui.QColor(self.link_color)))
             it.setToolTip(0, "Click to jump here")
             if editable:
                 it.setFlags(it.flags() | QtCore.Qt.ItemFlag.ItemIsEditable)

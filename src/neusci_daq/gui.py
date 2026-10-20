@@ -41,14 +41,15 @@ from . import session
 from . import stim as stimmod
 from . import style, theme
 from .backends import Backend, make_backend
-from .channels import ChannelRow, ChannelStrip, ColorButton
+from .channels import ChannelRow, ChannelRowWidget, ChannelStrip, ColorButton
 from .comments import CommentPopup, CommentsPanel
 from .config import Channel, Config, valid_inputs
 from .export import to_labchart_mat
 from .recorder import Recorder
 from .stim import Stimulus
 from .stimout import make_output
-from .stimwindow import StimWindow
+from .stimwindow import StimPage
+from .tabs import ONE, SIDE, STACKED, TabArea, layout_icon
 
 LIVE, REVIEW = "live", "review"
 
@@ -58,6 +59,15 @@ class WindowBox(QtWidgets.QDoubleSpinBox):
 
     def textFromValue(self, v: float) -> str:
         return f"{v:g}"
+
+
+class _CommentEdit(QtWidgets.QLineEdit):
+    """Asks the toolbar for little width, so nothing gets pushed into its overflow
+    menu on a narrow screen; it still grows into any free space."""
+
+    def sizeHint(self) -> QtCore.QSize:
+        h = super().sizeHint()
+        return QtCore.QSize(110, h.height())
 
 
 class MainWindow(QtWidgets.QMainWindow):
@@ -100,14 +110,16 @@ class MainWindow(QtWidgets.QMainWindow):
         self.stim_out = make_output(cfg, self.backend)
         self.stimulus = self._saved_stimulus()
         self.stim_repeat_s = float(self.settings.value("stim_repeat_s", 1.0))
-        self.stim_window: StimWindow | None = None
+        self.repeating = False
         self.stim_timer = QtCore.QTimer(self, timeout=self._repeat_fire)
+        self._compact_strips = False     # True while Acquisition shares the screen (split view)
 
         mode = self.settings.value("plot_theme", theme.DARK)
         self.plot_mode = mode if mode in theme.THEMES else theme.DARK
         self._build_ui()
         self._build_menu()
         self._build_live_plots()
+        self._apply_app_theme()
         self._alloc_buffers()
         self.timer = QtCore.QTimer(self, interval=33, timeout=self._refresh)
         self._rate_busy = False
@@ -135,7 +147,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.rate_box = QtWidgets.QComboBox(editable=True)
         self.rate_box.setInsertPolicy(QtWidgets.QComboBox.InsertPolicy.NoInsert)
         self.rate_box.addItems([f"{r:,} Hz" for r in cfgmod.RATE_PRESETS])
-        self.rate_box.setMinimumContentsLength(9)
+        self.rate_box.setMinimumContentsLength(8)
         self.rate_box.lineEdit().editingFinished.connect(self._rate_entered)
         self.rate_box.activated.connect(lambda *_: self._rate_entered())
         self.window_box = WindowBox(minimum=0.01, maximum=600, value=self.cfg.window_s,
@@ -144,10 +156,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.window_box.setMinimumWidth(80)
         self.window_box.valueChanged.connect(self._window_changed)
         # Only usable while recording, because that's when a comment can be saved.
-        self.comment_edit = QtWidgets.QLineEdit()
+        self.comment_edit = _CommentEdit()
         self.comment_edit.setAccessibleName("Comment")
         self.comment_edit.setToolTip("Shortcut: press C to jump here")
-        self.comment_edit.setMinimumWidth(160)
+        self.comment_edit.setMinimumWidth(110)
         self.comment_edit.returnPressed.connect(self._add_comment)
         self._set_comment_box(False)
         self.block_combo = QtWidgets.QComboBox()
@@ -159,25 +171,69 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btn_comments.setToolTip("Show or hide this block's comments")
         self.btn_comments.toggled.connect(self._toggle_comments)
 
-        self._live_actions = [tb.addWidget(self.btn_run), tb.addWidget(self.btn_rec), tb.addSeparator(),
-                              tb.addWidget(QtWidgets.QLabel("Sampling rate")), tb.addWidget(self.rate_box)]
-        self._review_actions = [tb.addWidget(QtWidgets.QLabel("Block")), tb.addWidget(self.block_combo)]
-        tb.addWidget(QtWidgets.QLabel("Window"))
-        tb.addWidget(self.window_box)
-        self._live_actions += [tb.addSeparator(), tb.addWidget(self.comment_edit)]
-        self._review_actions.append(tb.addWidget(self.btn_live))
-        spacer = QtWidgets.QWidget()            # in live mode the comment box fills this space
+        # Toolbar groups: shown per mode (live/review) and per visible tab.
+        A = lambda w: tb.addWidget(w)
+        self._tb_live = [A(self.btn_run), A(self.btn_rec), tb.addSeparator(),
+                         A(QtWidgets.QLabel("Sampling rate")), A(self.rate_box)]
+        self._tb_review = [A(QtWidgets.QLabel("Block")), A(self.block_combo)]
+        self._tb_acq = [A(QtWidgets.QLabel("Window")), A(self.window_box)]
+        self._tb_acq_live = [tb.addSeparator(), A(self.comment_edit)]
+        self._tb_review.append(A(self.btn_live))
+        spacer = QtWidgets.QWidget()            # fills the space when the comment box is hidden
         spacer.setSizePolicy(QtWidgets.QSizePolicy.Policy.Expanding, QtWidgets.QSizePolicy.Policy.Preferred)
-        self._review_actions.append(tb.addWidget(spacer))
-        tb.addWidget(self.btn_comments)
+        self._tb_spacer = A(spacer)
+        # Shown on every tab while a stimulus is going, so it can always be stopped.
+        self.stim_chip = QtWidgets.QWidget()
+        self.stim_chip.setObjectName("stimChip")
+        self.stim_chip.setAttribute(QtCore.Qt.WidgetAttribute.WA_StyledBackground, True)
+        cl = QtWidgets.QHBoxLayout(self.stim_chip)
+        cl.setContentsMargins(10, 2, 4, 2)
+        cl.setSpacing(6)
+        dot = QtWidgets.QLabel()
+        dot.setPixmap(style.dot_icon(style.START).pixmap(10, 10))
+        self.stim_chip_text = QtWidgets.QLabel("Stimulating")
+        self.stim_chip_text.setObjectName("stimChipText")
+        self.btn_chip_stop = QtWidgets.QPushButton("Stop")
+        self.btn_chip_stop.setToolTip("Stop the stimulus and set the output to 0 V (Esc)")
+        self.btn_chip_stop.clicked.connect(self.stop_stimulus)
+        cl.addWidget(dot); cl.addWidget(self.stim_chip_text); cl.addWidget(self.btn_chip_stop)
+        self._tb_chip = A(self.stim_chip)
+        # Split view: one tab, side by side, or top and bottom.
+        self.split_group = QtWidgets.QWidget()
+        self.split_group.setObjectName("splitGroup")
+        self.split_group.setAttribute(QtCore.Qt.WidgetAttribute.WA_StyledBackground, True)
+        sl = QtWidgets.QHBoxLayout(self.split_group)
+        sl.setContentsMargins(2, 2, 2, 2)
+        sl.setSpacing(2)
+        self.split_buttons = {}
+        group = QtWidgets.QButtonGroup(self)
+        group.setExclusive(True)
+        for mode, tip in ((ONE, "One tab"), (SIDE, "Split: side by side"), (STACKED, "Split: top and bottom")):
+            b = QtWidgets.QToolButton(checkable=True)
+            b.setToolTip(tip)
+            b.setAccessibleName(tip)
+            b.clicked.connect(lambda _=False, mode=mode: self.tabs.set_layout(mode))
+            group.addButton(b)
+            sl.addWidget(b)
+            self.split_buttons[mode] = b
+        self.split_buttons[ONE].setChecked(True)
         self.btn_theme = QtWidgets.QToolButton()
         self.btn_theme.setAutoRaise(True)
         self.btn_theme.setIconSize(QtCore.QSize(20, 20))
         self.btn_theme.clicked.connect(self.toggle_plot_theme)
-        tb.addWidget(self.btn_theme)
+        # Split buttons and the light/dark toggle sit at the right end of the tab bar
+        # (placed once the tabs exist), which keeps the toolbar narrow enough for laptops.
+        self.tab_corner = QtWidgets.QWidget()
+        cl2 = QtWidgets.QHBoxLayout(self.tab_corner)
+        cl2.setContentsMargins(0, 2, 0, 2)
+        cl2.setSpacing(6)
+        cl2.addWidget(self.split_group)
+        cl2.addWidget(self.btn_theme)
         self._update_theme_button()
         sc = QtGui.QShortcut(QtGui.QKeySequence("C"), self)
         sc.activated.connect(self._focus_comment)
+        QtGui.QShortcut(QtGui.QKeySequence("Ctrl+F"), self, activated=lambda: self.fire_stimulus())
+        QtGui.QShortcut(QtGui.QKeySequence("Esc"), self, activated=self._escape)
 
         central = QtWidgets.QWidget()
         lay = QtWidgets.QVBoxLayout(central)
@@ -188,7 +244,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.plot_layout.setContentsMargins(0, 0, 0, 0)
         self.plot_layout.setSpacing(2)
         self.plots, self.curves, self.strips = [], [], []
-        self.plot_widgets, self.curve_colors = [], []
+        self.plot_widgets, self.curve_colors, self.curve_widths = [], [], []
+        self.row_widgets = []
 
         self.channel_bar = QtWidgets.QWidget()
         cb = QtWidgets.QHBoxLayout(self.channel_bar)
@@ -201,6 +258,16 @@ class MainWindow(QtWidgets.QMainWindow):
         cb.addWidget(self.btn_add_ch)
         cb.addWidget(self.btn_save_setup)
         cb.addStretch(1)
+        # Bottom of the Acquisition page: channel buttons (live only) on the left,
+        # Comments on the right (live and review). It lives here rather than in the
+        # toolbar so it's on screen whenever Acquisition is, even in a split.
+        self.bottom_bar = QtWidgets.QWidget()
+        bb = QtWidgets.QHBoxLayout(self.bottom_bar)
+        bb.setContentsMargins(0, 0, 4, 0)
+        bb.setSpacing(0)
+        bb.addWidget(self.channel_bar, 1)
+        bb.addStretch(0)
+        bb.addWidget(self.btn_comments)
 
         self.scroll = QtWidgets.QScrollBar(QtCore.Qt.Orientation.Horizontal)
         self.scroll.valueChanged.connect(self._scrolled)
@@ -215,9 +282,20 @@ class MainWindow(QtWidgets.QMainWindow):
         row.addWidget(self.plot_area, 1)
         row.addWidget(self.comments_panel)
         lay.addLayout(row, 1)
-        lay.addWidget(self.channel_bar)
+        lay.addWidget(self.bottom_bar)
         lay.addWidget(self.scroll)
-        self.setCentralWidget(central)
+        self.stim_page = StimPage(self)
+        placeholder = lambda title, text: self._placeholder(title, text)
+        self.tabs = TabArea([
+            ("acq", "Acquisition", central),
+            ("stim", "Stimulator", self.stim_page),
+            ("scope", "Scope view", placeholder("Scope view", "Coming soon: overlay and average the pages "
+                                                              "around each stimulus.")),
+            ("analysis", "Analysis", placeholder("Analysis", "Coming soon.")),
+        ])
+        self.tabs.changed.connect(self._tabs_changed)
+        self.tabs.set_corner(self.tab_corner)
+        self.setCentralWidget(self.tabs)
 
         self.status = QtWidgets.QLabel()
         self.statusBar().addPermanentWidget(self.status)
@@ -263,27 +341,6 @@ class MainWindow(QtWidgets.QMainWindow):
             self.act_wiring[mode] = a
         self.wiring_menu.setToolTipsVisible(True)
 
-        st = self.menuBar().addMenu("S&timulator")
-        st.addAction("&Stimulus…", QtGui.QKeySequence("Ctrl+T"), self.open_stim_window)
-        self.act_fire = st.addAction("&Fire", QtGui.QKeySequence("Ctrl+F"), self.fire_stimulus)
-        self.act_repeat = st.addAction("&Repeat")
-        self.act_repeat.setCheckable(True)
-        self.act_repeat.toggled.connect(self.set_repeat)
-        st.addAction("S&top stimulus", self.stop_stimulus)
-        st.addSeparator()
-        self.stim_out_menu = st.addMenu("&Output")
-        group = QtGui.QActionGroup(self)
-        self.act_stim_out = {}
-        for ch in stimmod.AO_CHANNELS:
-            a = self.stim_out_menu.addAction(ch, lambda ch=ch: self.set_stim_output(ch))
-            a.setCheckable(True)
-            group.addAction(a)
-            self.act_stim_out[ch] = a
-        self.act_stim_out[self.cfg.stim_output].setChecked(True)
-        self.monitor_menu = st.addMenu("Record stimulus &on")
-        self.monitor_menu.aboutToShow.connect(self._fill_monitor_menu)
-        self.monitor_menu.setToolTipsVisible(True)
-        st.setToolTipsVisible(True)
 
     # -- plots -------------------------------------------------------------
     def _clear_plot_area(self):
@@ -294,9 +351,10 @@ class MainWindow(QtWidgets.QMainWindow):
                 w.setParent(None)
                 w.deleteLater()
         self.plots, self.curves, self.strips = [], [], []
-        self.plot_widgets, self.curve_colors = [], []
+        self.plot_widgets, self.curve_colors, self.curve_widths = [], [], []
+        self.row_widgets = []
 
-    def _new_plot(self, name: str, unit: str, color: str) -> pg.PlotWidget:
+    def _new_plot(self, name: str, unit: str, color: str, width: float = 1.0) -> pg.PlotWidget:
         pw = pg.PlotWidget()
         p = pw.getPlotItem()
         self.plot_widgets.append(pw)
@@ -313,6 +371,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.plots.append(p)
         self.curves.append(p.plot())
         self.curve_colors.append(color)
+        self.curve_widths.append(float(width))
         self._set_curve_color(len(self.curves) - 1, color)
         self._style_plot(pw)
         return pw
@@ -332,23 +391,23 @@ class MainWindow(QtWidgets.QMainWindow):
         inputs = valid_inputs(self.cfg)
         locked = self.recorder.recording
         for r in self.rows:
-            row_w = QtWidgets.QWidget()
-            h = QtWidgets.QHBoxLayout(row_w)
-            h.setContentsMargins(0, 0, 0, 0)
             strip = ChannelStrip(r, inputs, self.cfg.terminal_config == "DIFF",
                                  self._channel_edited, self._channel_removed, self._channel_recolored,
-                                 can_remove=len(self.rows) > 1)
+                                 can_remove=len(self.rows) > 1, on_width=self._channel_width)
             strip.set_locked(locked)
             self.strips.append(strip)
-            h.addWidget(strip, 0)
             if r.ch.enabled:
-                h.addWidget(self._new_plot(r.ch.name, r.ch.units, r.ch.color), 1)
+                content = self._new_plot(r.ch.name, r.ch.units, r.ch.color, r.ch.width)
+            else:
+                content = QtWidgets.QLabel("off")
+                content.setStyleSheet("color: gray; padding-left: 8px")
+            row_w = ChannelRowWidget(strip, content)
+            row_w.set_compact(self._compact_strips)
+            self.row_widgets.append(row_w)
+            if r.ch.enabled:
                 self.plot_layout.addWidget(row_w, 1)
             else:
-                off = QtWidgets.QLabel("off")
-                off.setStyleSheet("color: gray; padding-left: 8px")
-                h.addWidget(off, 1)
-                strip.setMaximumHeight(strip.sizeHint().height())
+                row_w.setFixedHeight(strip.sizeHint().height())
                 self.plot_layout.addWidget(row_w, 0)
         self._finish_plots()
         self.btn_add_ch.setEnabled(not locked)
@@ -366,7 +425,8 @@ class MainWindow(QtWidgets.QMainWindow):
                               tooltip="Change this channel's colour in every block of this session")
             self.review_color_btns.append(btn)
             h.addWidget(btn, 0)
-            pw = self._new_plot(name, unit, color)
+            widths = {r.ch.name: r.ch.width for r in self.rows}
+            pw = self._new_plot(name, unit, color, widths.get(name, 1.0))
             pw.setToolTip("Double-click to add a comment")
             pw.scene().sigMouseClicked.connect(lambda ev, pw=pw: self._plot_clicked(pw, ev))
             h.addWidget(pw, 1)
@@ -377,7 +437,22 @@ class MainWindow(QtWidgets.QMainWindow):
     def _set_curve_color(self, k: int, color: str) -> None:
         """Draw trace k in `color` (adjusted for contrast on the current background)."""
         self.curve_colors[k] = color
-        self.curves[k].setPen(pg.mkPen(theme.display_color(color, self.plot_mode)))
+        self.curves[k].setPen(pg.mkPen(theme.display_color(color, self.plot_mode), width=self.curve_widths[k]))
+
+    def _channel_width(self, strip: ChannelStrip, width: float) -> None:
+        self.set_channel_width(self.rows.index(strip.row), width)
+
+    def set_channel_width(self, index: int, width: float) -> None:
+        """Change a channel's line thickness (display only; allowed while recording)."""
+        from .channels import LINE_MAX, LINE_MIN
+        width = min(LINE_MAX, max(LINE_MIN, float(width)))
+        ch = self.rows[index].ch
+        ch.width = width
+        if ch in self.cfg.channels:
+            k = self.cfg.channels.index(ch)
+            if self.mode == LIVE and k < len(self.curves):
+                self.curve_widths[k] = width
+                self._set_curve_color(k, self.curve_colors[k])
 
     def _style_plot(self, pw: pg.PlotWidget) -> None:
         th = theme.THEMES[self.plot_mode]
@@ -388,17 +463,30 @@ class MainWindow(QtWidgets.QMainWindow):
             ax.setTextPen(th.foreground)
 
     def _update_theme_button(self) -> None:
-        # Window text colour: black normally, white if the operating system uses a dark window.
-        ink = self.palette().color(QtGui.QPalette.ColorRole.WindowText)
+        ink = style.tokens(self._app_mode())["ink"]
         self.btn_theme.setIcon(theme.toggle_icon(self.plot_mode, ink))
-        self.btn_theme.setToolTip("Dark plots: click for light plots" if self.plot_mode == theme.DARK
-                                  else "Light plots: click for dark plots")
+        self.btn_theme.setToolTip("Dark mode: click for light mode" if self.plot_mode == theme.DARK
+                                  else "Light mode: click for dark mode")
+        for mode, b in getattr(self, "split_buttons", {}).items():
+            b.setIcon(layout_icon(mode, ink))
+
+    def _app_mode(self) -> str:
+        return style.DARK if self.plot_mode == theme.DARK else style.LIGHT
+
+    def _apply_app_theme(self) -> None:
+        """The window's own colours (the plots are styled separately)."""
+        mode = self._app_mode()
+        style.restyle(mode)
+        self.comments_panel.link_color = style.tokens(mode)["link"]
+        self.stim_page.apply_theme(mode)
+        self._update_theme_button()
+        self.refresh_comments(redraw_markers=False)
 
     def toggle_plot_theme(self) -> None:
         self.set_plot_theme(theme.LIGHT if self.plot_mode == theme.DARK else theme.DARK)
 
     def set_plot_theme(self, mode: str) -> None:
-        """Switch plot backgrounds between dark and light. Display only; remembered on this computer."""
+        """Switch the whole app, plots included, between dark and light. Remembered on this computer."""
         self.plot_mode = mode
         self.settings.setValue("plot_theme", mode)
         for pw in self.plot_widgets:
@@ -411,7 +499,58 @@ class MainWindow(QtWidgets.QMainWindow):
                 ln.setPen(pg.mkPen(mc, style=QtCore.Qt.PenStyle.DashLine))
                 if getattr(ln, "label", None) is not None:   # only the top plot's line has one
                     ln.label.setColor(mc)
-        self._update_theme_button()
+        self._apply_app_theme()
+
+    # -- tabs ----------------------------------------------------------------
+    def _placeholder(self, title: str, text: str) -> QtWidgets.QWidget:
+        w = QtWidgets.QWidget()
+        v = QtWidgets.QVBoxLayout(w)
+        v.addStretch(1)
+        for t, big in ((title, True), (text, False)):
+            lab = QtWidgets.QLabel(t)
+            lab.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+            if big:
+                f = lab.font(); f.setPointSizeF(f.pointSizeF() * 1.4); f.setBold(True); lab.setFont(f)
+            v.addWidget(lab)
+        v.addStretch(1)
+        return w
+
+    def _tabs_changed(self):
+        for mode, b in self.split_buttons.items():
+            b.setChecked(mode == self.tabs.layout_mode)
+        compact = self.tabs.shares_screen("acq")
+        if compact != self._compact_strips:
+            self._compact_strips = compact
+            for rw in self.row_widgets:
+                rw.set_compact(compact)
+        self._update_toolbar()
+
+    def _update_toolbar(self):
+        """Show the controls that apply to what's on screen."""
+        if not hasattr(self, "tabs"):
+            return
+        live, acq = self.mode == LIVE, self.tabs.is_visible("acq")
+        for a in self._tb_live:
+            a.setVisible(live)
+        for a in self._tb_review:
+            a.setVisible(not live and acq)
+        for a in self._tb_acq:
+            a.setVisible(acq)
+        for a in self._tb_acq_live:
+            a.setVisible(live and acq)
+        self._tb_spacer.setVisible(not (live and acq))
+        self._update_stim_chip()
+
+    def _update_stim_chip(self):
+        busy = self.stim_out is not None and self.stim_out.busy
+        on = self.repeating or busy
+        if on:
+            self.stim_chip_text.setText(f"Stimulating · {self.stim_repeat_s:g} s" if self.repeating
+                                        else "Stimulating")
+            self.stim_chip.setToolTip(f"Repeating every {self.stim_repeat_s:g} s" if self.repeating
+                                      else "A stimulus is being sent")
+        if self._tb_chip.isVisible() != on:
+            self._tb_chip.setVisible(on)
 
     # -- changing channels -------------------------------------------------
     def _copy_rows(self) -> list[ChannelRow]:
@@ -698,10 +837,7 @@ class MainWindow(QtWidgets.QMainWindow):
     # ======================================================================
     def _set_mode(self, mode: str):
         self.mode = mode
-        for a in self._live_actions:
-            a.setVisible(mode == LIVE)
-        for a in self._review_actions:
-            a.setVisible(mode == REVIEW)
+        self._update_toolbar()
         self.scroll.setVisible(mode == REVIEW)
         self.channel_bar.setVisible(mode == LIVE)
         self.wiring_menu.setEnabled(mode == LIVE and not self.recorder.recording)
@@ -1259,23 +1395,30 @@ class MainWindow(QtWidgets.QMainWindow):
             return Stimulus()
 
     def set_stimulus(self, s: Stimulus) -> None:
+        """Use stimulus `s` for Fire and Repeat, and show it in the Stimulator tab."""
+        self._stimulus_edited(s)
+        if hasattr(self, "stim_page"):
+            self.stim_page.set_stimulus(s)
+
+    def _stimulus_edited(self, s: Stimulus) -> None:
         """The stimulus that Fire and Repeat send (remembered between runs)."""
         import json
         self.stimulus = s
         self.settings.setValue("stimulus", json.dumps(s.to_dict()))
 
-    def open_stim_window(self) -> StimWindow:
-        if self.stim_window is None:
-            self.stim_window = StimWindow(self)
-        self.stim_window.show()
-        self.stim_window.raise_()
-        self.stim_window.activateWindow()
-        return self.stim_window
+    def open_stim_window(self) -> StimPage:
+        """Show the Stimulator tab."""
+        self.tabs.show_tab("stim")
+        return self.stim_page
 
     def _stim_message(self, text: str, error: bool = False) -> None:
         self.statusBar().showMessage(("⚠ " if error else "") + text, 10000)
-        if self.stim_window is not None:
-            self.stim_window.show_message(text, error)
+        self.stim_page.show_message(text, error)
+
+    def _escape(self):
+        if self.repeating or (self.stim_out is not None and self.stim_out.busy):
+            self.stop_stimulus()
+            self._stim_message("Stimulus stopped")
 
     def fire_stimulus(self) -> bool:
         """Send the current stimulus once. Returns False (with a message) if it can't."""
@@ -1296,23 +1439,33 @@ class MainWindow(QtWidgets.QMainWindow):
         if self.recorder.recording:
             self._log_comment(f"Stim: {desc}")
         self._stim_message(f"Stimulus sent on {self.cfg.stim_output}: {desc}")
+        self._update_stim_chip()
         return True
 
     def stop_stimulus(self) -> None:
-        self.act_repeat.setChecked(False)
+        self.set_repeat(False)
         if self.stim_out is not None:
             self.stim_out.stop()
+        self._update_stim_chip()
 
     def set_repeat(self, on: bool) -> None:
-        if on:
+        if on and not self.repeating:
+            self.repeating = True          # set first, so the chip shows "every N s"
             if not self.fire_stimulus():
-                self.act_repeat.setChecked(False)
-                return
-            self.stim_timer.start(int(self.stim_repeat_s * 1000))
-            self._stim_message(f"Repeating every {self.stim_repeat_s:g} s")
-        else:
+                self.repeating = False
+            else:
+                self.stim_timer.start(int(self.stim_repeat_s * 1000))
+                self._stim_message(f"Repeating every {self.stim_repeat_s:g} s")
+        elif not on:
+            self.repeating = False
             self.stim_timer.stop()
         self.settings.setValue("stim_repeat_s", self.stim_repeat_s)
+        b = self.stim_page.btn_repeat
+        if b.isChecked() != self.repeating:
+            b.blockSignals(True)
+            b.setChecked(self.repeating)
+            b.blockSignals(False)
+        self._update_stim_chip()
 
     def _repeat_fire(self):
         if self.stim_out is not None and self.stim_out.busy:
@@ -1320,7 +1473,7 @@ class MainWindow(QtWidgets.QMainWindow):
                                "Use a longer repeat time.", error=True)
             return
         if not self.fire_stimulus():
-            self.act_repeat.setChecked(False)
+            self.set_repeat(False)
         elif self.stim_timer.interval() != int(self.stim_repeat_s * 1000):
             self.stim_timer.setInterval(int(self.stim_repeat_s * 1000))
 
@@ -1328,29 +1481,21 @@ class MainWindow(QtWidgets.QMainWindow):
         if self.stim_out is not None and self.stim_out.busy:
             self.stop_stimulus()
         self.cfg.stim_output = ch
-        self.act_stim_out[ch].setChecked(True)
-        if self.stim_window is not None:
-            self.stim_window._update_preview()
+        self.stim_page.sync()
         self.statusBar().showMessage(f"Stimulator output: {ch}", 6000)
 
-    def _fill_monitor_menu(self):
-        m = self.monitor_menu
-        m.clear()
+    def monitor_choices(self) -> list[tuple[str, str, bool, str]]:
+        """Inputs the stimulus can be recorded on: (label, input, usable, tooltip)."""
         used = {r.ch.physical: r.ch.name for r in self.rows
                 if not (r.ch.physical == self.cfg.stim_monitor and r.ch.name == "Stim")}
-        none = m.addAction("None", lambda: self.set_stim_monitor(""))
-        none.setCheckable(True)
-        none.setChecked(not self.cfg.stim_monitor)
+        out = [("None (don't record it)", "", True, "")]
         for phys in valid_inputs(self.cfg):
-            a = m.addAction(phys, lambda phys=phys: self.set_stim_monitor(phys))
-            a.setCheckable(True)
-            a.setChecked(phys == self.cfg.stim_monitor)
             if phys in used:
-                a.setEnabled(False)
-                a.setToolTip(f"Used by {used[phys]}")
+                out.append((f"{phys} (used by {used[phys]})", phys, False, f"Used by {used[phys]}"))
             else:
                 pair = f" (minus input ai{int(phys[2:]) + 4})" if self.cfg.terminal_config == "DIFF" else ""
-                a.setToolTip(f"Wire {self.cfg.stim_output} to {phys}{pair}, and AO GND to AI GND")
+                out.append((phys, phys, True, f"Wire {self.cfg.stim_output} to {phys}{pair}, and AO GND to AI GND"))
+        return out
 
     def set_stim_monitor(self, phys: str) -> bool:
         """Record the stimulus on input `phys` (a channel named Stim), or stop recording it ("")."""
@@ -1371,6 +1516,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if not self.apply_channels(rows):
             return False
         self.cfg.stim_monitor = phys
+        self.stim_page.sync()
         self.statusBar().showMessage(f"Recording the stimulus on {phys}" if phys
                                      else "Not recording the stimulus", 8000)
         return True
@@ -1489,18 +1635,22 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _add_marker(self, t: float, text: str):
         lines = []
-        # Stagger labels over three heights so nearby comments don't print on top of each other.
-        label_y = 0.92 - 0.09 * (len(self.markers) % 3)
+        # Stagger labels over three heights so nearby comments don't print on top of each
+        # other, and keep them short on the plot (the Comments list has the full text).
+        self._marker_count = getattr(self, "_marker_count", 0) + 1
+        label_y = 0.92 - 0.09 * ((self._marker_count - 1) % 3)
+        short = text if len(text) <= 32 else text[:31].rstrip() + "…"
         for p in self.plots:
             mc = theme.THEMES[self.plot_mode].marker
             ln = pg.InfiniteLine(t, angle=90, pen=pg.mkPen(mc, style=QtCore.Qt.PenStyle.DashLine),
-                                 label=text if p is self.plots[0] else None,
+                                 label=short if p is self.plots[0] else None,
                                  labelOpts={"position": label_y, "color": mc})
             p.addItem(ln)
             lines.append(ln)
         self.markers.append((t, lines))
 
     def _clear_markers(self):
+        self._marker_count = 0
         for _, lines in self.markers:
             for p, ln in zip(getattr(self, "plots", []), lines):
                 p.removeItem(ln)
@@ -1514,8 +1664,9 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         if self.stim_out is not None and self.stim_out.error is not None:
             err, self.stim_out.error = self.stim_out.error, None
-            self.act_repeat.setChecked(False)
+            self.set_repeat(False)
             self._stim_message(f"Stimulus failed: {err}", error=True)
+        self._update_stim_chip()
         ts, ys = [], []
         while True:
             try:
@@ -1591,7 +1742,8 @@ def run(cfg: Config, config_path: str | Path | None = None):
         import ctypes
         ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("neusci.daq.visualizer")
     app.setWindowIcon(app_icon())
-    style.apply(app)
+    saved = QtCore.QSettings("neusci", "neusci-daq-visualizer").value("plot_theme", theme.DARK)
+    style.apply(app, style.DARK if saved == theme.DARK else style.LIGHT)
     w = MainWindow(cfg, config_path=config_path)
     w.resize(1300, 200 + 180 * len(cfg.channels))
     w.show()
