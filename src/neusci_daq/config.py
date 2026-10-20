@@ -99,6 +99,11 @@ class Config:
     spare_channels: list[Channel] = field(default_factory=list)  # switched off: kept so they can be switched back on
     window_s: float = 10.0
     data_dir: str = "data"
+    # Stimulator (analog output)
+    stim_output: str = "ao0"      # "ao0" | "ao1"
+    stim_rate: float = 5000.0     # output samples per second (USB-6003 max 5,000)
+    stim_max_v: float = 5.0       # safety limit: stimuli above this are refused
+    stim_monitor: str = ""        # input that records the stimulus (wired from the output), or ""
 
     @property
     def aggregate_rate(self) -> float:
@@ -118,6 +123,7 @@ def valid_inputs(cfg: Config) -> list[str]:
 def load(path: str | Path) -> Config:
     raw = tomllib.loads(Path(path).read_text(encoding="utf-8"))
     dev, disp, rec = raw.get("device", {}), raw.get("display", {}), raw.get("recording", {})
+    st = raw.get("stimulator", {})
     chans = []
     for c in raw.get("channels", []):
         ch = Channel(**{k: v for k, v in c.items() if k != "range"})
@@ -134,6 +140,10 @@ def load(path: str | Path) -> Config:
         terminal_config=dev.get("terminal_config", "RSE").upper(),
         window_s=float(disp.get("window_s", 10)),
         data_dir=rec.get("directory", "data"),
+        stim_output=str(st.get("output", "ao0")).lower(),
+        stim_rate=float(st.get("rate", 5000)),
+        stim_max_v=float(st.get("max_voltage", 5.0)),
+        stim_monitor=str(st.get("monitor", "")).lower(),
     ).with_channels(chans)
     validate(cfg)
     return cfg
@@ -147,6 +157,12 @@ def validate(cfg: Config) -> None:
         raise ValueError(f"Unknown backend {cfg.backend!r}")
     if cfg.terminal_config not in ("RSE", "DIFF"):
         raise ValueError("terminal_config must be RSE or DIFF (USB-600x has no NRSE).")
+    if cfg.stim_output not in ("ao0", "ao1"):
+        raise ValueError("[stimulator] output must be ao0 or ao1.")
+    if not 0 < cfg.stim_rate <= 5000:
+        raise ValueError("[stimulator] rate must be between 0 and 5,000 S/s (USB-6003 limit).")
+    if not 0 < cfg.stim_max_v <= 10:
+        raise ValueError("[stimulator] max_voltage must be between 0 and 10 V.")
     if cfg.sample_rate <= 0:
         raise ValueError("Sample rate must be positive.")
     if cfg.aggregate_rate > USB6003_MAX_AGGREGATE_RATE:
@@ -202,6 +218,12 @@ def dumps(cfg: Config) -> str:
         "",
         "[recording]",
         f"directory = {_s(cfg.data_dir)}",
+        "",
+        "[stimulator]",
+        f"output = {_s(cfg.stim_output)}",
+        f"rate = {cfg.stim_rate:g}",
+        f"max_voltage = {cfg.stim_max_v:g}",
+        f"monitor = {_s(cfg.stim_monitor)}",
     ]
     for c in cfg.channels + cfg.spare_channels:
         lines += ["", "[[channels]]",

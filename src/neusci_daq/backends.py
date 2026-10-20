@@ -81,8 +81,24 @@ class Backend:
 class SimulatedBackend(Backend):
     """Fake signals for developing without hardware: sine + noise + occasional spikes."""
 
+    _pending = None    # (monitor input, waveform at the input rate) from SimulatedOutput
+
     def _setup(self):
         self._rng = np.random.default_rng(0)
+        self._stim = None             # (monitor, wave, response, position)
+
+    def inject(self, monitor: str, wave: np.ndarray, rate: float) -> None:
+        """Play a stimulus: `wave` appears on the `monitor` input, and the other
+        channels get a small evoked response 5 ms later (simulation only)."""
+        fs = self.cfg.sample_rate
+        t_in = np.arange(len(wave)) / rate
+        t_ai = np.arange(0, len(wave) / rate, 1.0 / fs)
+        w = np.interp(t_ai, t_in, wave) if len(wave) > 1 else np.asarray(wave, float)
+        peak = float(np.max(np.abs(w))) if w.size else 0.0
+        k = np.arange(int(0.05 * fs)) / fs                      # 50 ms response
+        resp = 0.3 * peak * (k / 0.004) * np.exp(1 - k / 0.004)   # alpha function, peak at 4 ms
+        resp = np.concatenate([np.zeros(int(0.005 * fs)), resp])
+        self._pending = (monitor, w, resp)
 
     def _loop(self):
         fs, n, cs = self.cfg.sample_rate, len(self.cfg.channels), self.cfg.chunk_size
@@ -97,6 +113,24 @@ class SimulatedBackend(Backend):
                 data[i] = 0.5 * np.sin(2 * np.pi * (1 + k) * t) + 0.02 * self._rng.standard_normal(cs)
                 spikes = self._rng.random(cs) < 2 / fs   # ~2 spikes/s
                 data[i, spikes] += 2.0
+            if self._pending is not None:
+                monitor, w, resp = self._pending
+                self._pending = None
+                self._stim = (monitor, w, resp, 0)
+            if self._stim is not None:
+                monitor, w, resp, pos = self._stim
+                for i, ch in enumerate(self.cfg.channels):
+                    src = w if ch.physical == monitor else resp
+                    if ch.physical == monitor:
+                        data[i] = 0.002 * self._rng.standard_normal(cs)   # a clean wire
+                    seg = src[pos:pos + cs]
+                    data[i, :len(seg)] += seg
+                pos += cs
+                self._stim = None if pos >= max(len(w), len(resp)) else (monitor, w, resp, pos)
+            else:
+                for i, ch in enumerate(self.cfg.channels):
+                    if ch.physical == self.cfg.stim_monitor:
+                        data[i] = 0.002 * self._rng.standard_normal(cs)
             self._publish(Chunk(data, t, idx))
             idx += cs
             # pace to real time

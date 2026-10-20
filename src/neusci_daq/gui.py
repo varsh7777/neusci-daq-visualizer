@@ -38,6 +38,7 @@ from pyqtgraph.Qt import QtCore, QtGui, QtWidgets
 
 from . import config as cfgmod
 from . import session
+from . import stim as stimmod
 from . import style, theme
 from .backends import Backend, make_backend
 from .channels import ChannelRow, ChannelStrip, ColorButton
@@ -45,6 +46,9 @@ from .comments import CommentPopup, CommentsPanel
 from .config import Channel, Config, valid_inputs
 from .export import to_labchart_mat
 from .recorder import Recorder
+from .stim import Stimulus
+from .stimout import make_output
+from .stimwindow import StimWindow
 
 LIVE, REVIEW = "live", "review"
 
@@ -91,6 +95,13 @@ class MainWindow(QtWidgets.QMainWindow):
         # The channel setup the user edits in the strips next to each plot.
         cfgmod.fill_colors(cfg.channels + cfg.spare_channels)
         self.rows = [ChannelRow(c) for c in cfg.channels + cfg.spare_channels]
+
+        # Stimulator
+        self.stim_out = make_output(cfg, self.backend)
+        self.stimulus = self._saved_stimulus()
+        self.stim_repeat_s = float(self.settings.value("stim_repeat_s", 1.0))
+        self.stim_window: StimWindow | None = None
+        self.stim_timer = QtCore.QTimer(self, timeout=self._repeat_fire)
 
         mode = self.settings.value("plot_theme", theme.DARK)
         self.plot_mode = mode if mode in theme.THEMES else theme.DARK
@@ -251,6 +262,28 @@ class MainWindow(QtWidgets.QMainWindow):
             group.addAction(a)
             self.act_wiring[mode] = a
         self.wiring_menu.setToolTipsVisible(True)
+
+        st = self.menuBar().addMenu("S&timulator")
+        st.addAction("&Stimulus…", QtGui.QKeySequence("Ctrl+T"), self.open_stim_window)
+        self.act_fire = st.addAction("&Fire", QtGui.QKeySequence("Ctrl+F"), self.fire_stimulus)
+        self.act_repeat = st.addAction("&Repeat")
+        self.act_repeat.setCheckable(True)
+        self.act_repeat.toggled.connect(self.set_repeat)
+        st.addAction("S&top stimulus", self.stop_stimulus)
+        st.addSeparator()
+        self.stim_out_menu = st.addMenu("&Output")
+        group = QtGui.QActionGroup(self)
+        self.act_stim_out = {}
+        for ch in stimmod.AO_CHANNELS:
+            a = self.stim_out_menu.addAction(ch, lambda ch=ch: self.set_stim_output(ch))
+            a.setCheckable(True)
+            group.addAction(a)
+            self.act_stim_out[ch] = a
+        self.act_stim_out[self.cfg.stim_output].setChecked(True)
+        self.monitor_menu = st.addMenu("Record stimulus &on")
+        self.monitor_menu.aboutToShow.connect(self._fill_monitor_menu)
+        self.monitor_menu.setToolTipsVisible(True)
+        st.setToolTipsVisible(True)
 
     # -- plots -------------------------------------------------------------
     def _clear_plot_area(self):
@@ -1146,6 +1179,7 @@ class MainWindow(QtWidgets.QMainWindow):
         else:
             if self.btn_rec.isChecked():
                 self.btn_rec.setChecked(False)
+            self.stop_stimulus()
             self.backend.stop()
             self.timer.stop()
             self.btn_run.setText("Start")
@@ -1208,10 +1242,138 @@ class MainWindow(QtWidgets.QMainWindow):
         text = self.comment_edit.text().strip()
         if not text or not self.recorder.recording:
             return
+        self._log_comment(text)
+        self.comment_edit.clear()
+
+    def _log_comment(self, text: str) -> None:
         t = self.recorder.add_comment(text)      # saved to the block straight away
         self._add_marker(t - self._axis_zero, text)
-        self.comment_edit.clear()
         self.refresh_comments(redraw_markers=False)
+
+    # -- stimulator ----------------------------------------------------------
+    def _saved_stimulus(self) -> Stimulus:
+        import json
+        try:
+            return Stimulus.from_dict(json.loads(self.settings.value("stimulus", "") or "{}"))
+        except Exception:
+            return Stimulus()
+
+    def set_stimulus(self, s: Stimulus) -> None:
+        """The stimulus that Fire and Repeat send (remembered between runs)."""
+        import json
+        self.stimulus = s
+        self.settings.setValue("stimulus", json.dumps(s.to_dict()))
+
+    def open_stim_window(self) -> StimWindow:
+        if self.stim_window is None:
+            self.stim_window = StimWindow(self)
+        self.stim_window.show()
+        self.stim_window.raise_()
+        self.stim_window.activateWindow()
+        return self.stim_window
+
+    def _stim_message(self, text: str, error: bool = False) -> None:
+        self.statusBar().showMessage(("⚠ " if error else "") + text, 10000)
+        if self.stim_window is not None:
+            self.stim_window.show_message(text, error)
+
+    def fire_stimulus(self) -> bool:
+        """Send the current stimulus once. Returns False (with a message) if it can't."""
+        if self.stim_out is None:
+            self._stim_message("The stimulator needs the nidaqmx (or simulated) backend.", error=True)
+            return False
+        if self.mode != LIVE or not self.backend.running:
+            self._stim_message("Press Start first: stimuli are sent while acquiring.", error=True)
+            return False
+        try:
+            wave = self.stimulus.waveform(self.cfg.stim_rate)
+            stimmod.check_limit(wave, self.cfg.stim_max_v)
+            self.stim_out.fire(wave, self.cfg.stim_rate)
+        except (ValueError, RuntimeError) as e:
+            self._stim_message(str(e), error=True)
+            return False
+        desc = self.stimulus.describe()
+        if self.recorder.recording:
+            self._log_comment(f"Stim: {desc}")
+        self._stim_message(f"Stimulus sent on {self.cfg.stim_output}: {desc}")
+        return True
+
+    def stop_stimulus(self) -> None:
+        self.act_repeat.setChecked(False)
+        if self.stim_out is not None:
+            self.stim_out.stop()
+
+    def set_repeat(self, on: bool) -> None:
+        if on:
+            if not self.fire_stimulus():
+                self.act_repeat.setChecked(False)
+                return
+            self.stim_timer.start(int(self.stim_repeat_s * 1000))
+            self._stim_message(f"Repeating every {self.stim_repeat_s:g} s")
+        else:
+            self.stim_timer.stop()
+        self.settings.setValue("stim_repeat_s", self.stim_repeat_s)
+
+    def _repeat_fire(self):
+        if self.stim_out is not None and self.stim_out.busy:
+            self._stim_message("Skipped one repeat: the previous stimulus was still running. "
+                               "Use a longer repeat time.", error=True)
+            return
+        if not self.fire_stimulus():
+            self.act_repeat.setChecked(False)
+        elif self.stim_timer.interval() != int(self.stim_repeat_s * 1000):
+            self.stim_timer.setInterval(int(self.stim_repeat_s * 1000))
+
+    def set_stim_output(self, ch: str) -> None:
+        if self.stim_out is not None and self.stim_out.busy:
+            self.stop_stimulus()
+        self.cfg.stim_output = ch
+        self.act_stim_out[ch].setChecked(True)
+        if self.stim_window is not None:
+            self.stim_window._update_preview()
+        self.statusBar().showMessage(f"Stimulator output: {ch}", 6000)
+
+    def _fill_monitor_menu(self):
+        m = self.monitor_menu
+        m.clear()
+        used = {r.ch.physical: r.ch.name for r in self.rows
+                if not (r.ch.physical == self.cfg.stim_monitor and r.ch.name == "Stim")}
+        none = m.addAction("None", lambda: self.set_stim_monitor(""))
+        none.setCheckable(True)
+        none.setChecked(not self.cfg.stim_monitor)
+        for phys in valid_inputs(self.cfg):
+            a = m.addAction(phys, lambda phys=phys: self.set_stim_monitor(phys))
+            a.setCheckable(True)
+            a.setChecked(phys == self.cfg.stim_monitor)
+            if phys in used:
+                a.setEnabled(False)
+                a.setToolTip(f"Used by {used[phys]}")
+            else:
+                pair = f" (minus input ai{int(phys[2:]) + 4})" if self.cfg.terminal_config == "DIFF" else ""
+                a.setToolTip(f"Wire {self.cfg.stim_output} to {phys}{pair}, and AO GND to AI GND")
+
+    def set_stim_monitor(self, phys: str) -> bool:
+        """Record the stimulus on input `phys` (a channel named Stim), or stop recording it ("")."""
+        old = self.cfg.stim_monitor
+        if phys == old:
+            return True
+        rows = [r for r in self._copy_rows() if not (old and r.ch.physical == old and r.ch.name == "Stim")]
+        if phys:
+            taken = [r.ch.name for r in rows if r.ch.physical == phys]
+            if taken:
+                self._channel_message(f"{phys} is already used by {taken[0]}.")
+                return False
+            if any(r.ch.name == "Stim" for r in rows):
+                self._channel_message("Another channel is already named Stim; rename it first.")
+                return False
+            color = cfgmod.next_color(r.ch.color for r in rows)
+            rows.append(ChannelRow(Channel(phys, "Stim", units="V", color=color)))
+        if not self.apply_channels(rows):
+            return False
+        self.cfg.stim_monitor = phys
+        self.statusBar().showMessage(f"Recording the stimulus on {phys}" if phys
+                                     else "Not recording the stimulus", 8000)
+        return True
 
     def _set_comment_box(self, recording: bool):
         self.comment_edit.setEnabled(recording)
@@ -1350,6 +1512,10 @@ class MainWindow(QtWidgets.QMainWindow):
             self.btn_run.setChecked(False)
             QtWidgets.QMessageBox.critical(self, "Acquisition stopped", repr(err))
             return
+        if self.stim_out is not None and self.stim_out.error is not None:
+            err, self.stim_out.error = self.stim_out.error, None
+            self.act_repeat.setChecked(False)
+            self._stim_message(f"Stimulus failed: {err}", error=True)
         ts, ys = [], []
         while True:
             try:
@@ -1393,6 +1559,9 @@ class MainWindow(QtWidgets.QMainWindow):
             ev.ignore()
             return
         self.recorder.stop()
+        self.stim_timer.stop()
+        if self.stim_out is not None:
+            self.stim_out.stop()             # output to 0 V
         self.backend.stop()
         self._flush_review_mat()
         if self.session_saved:
