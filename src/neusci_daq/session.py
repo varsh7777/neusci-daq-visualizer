@@ -178,6 +178,20 @@ def recolor_blocks(blocks, colors: dict[str, str]) -> list[Path]:
     return failed
 
 
+def read_comments(path: str | Path) -> list[dict]:
+    """A block's comments as [{t, sample_index, text}], in time order."""
+    from .recorder import _decode_comments
+    with h5py.File(path, "r") as f:
+        return sorted(_decode_comments(f["comments"][:]), key=lambda c: c["t"])
+
+
+def write_comments(path: str | Path, comments: list[dict]) -> None:
+    """Replace a recorded block's comments. Only the comments change, never the data."""
+    from .recorder import _write_comments
+    with h5py.File(path, "r+") as f:
+        _write_comments(f, comments)
+
+
 def add_recent(recent: list[str], path: str | Path, limit: int = 8) -> list[str]:
     """Move `path` to the front of the recent list, without duplicates."""
     p = str(Path(path).resolve())

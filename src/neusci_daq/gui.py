@@ -38,14 +38,22 @@ from pyqtgraph.Qt import QtCore, QtGui, QtWidgets
 
 from . import config as cfgmod
 from . import session
-from . import theme
+from . import style, theme
 from .backends import Backend, make_backend
 from .channels import ChannelRow, ChannelStrip, ColorButton
+from .comments import CommentPopup, CommentsPanel
 from .config import Channel, Config, valid_inputs
 from .export import to_labchart_mat
 from .recorder import Recorder
 
 LIVE, REVIEW = "live", "review"
+
+
+class WindowBox(QtWidgets.QDoubleSpinBox):
+    """Window length in seconds, shown as "10 s" rather than "10.00 s"."""
+
+    def textFromValue(self, v: float) -> str:
+        return f"{v:g}"
 
 
 class MainWindow(QtWidgets.QMainWindow):
@@ -72,6 +80,14 @@ class MainWindow(QtWidgets.QMainWindow):
         self.review_color_btns: list[ColorButton] = []
         # "Recolour recorded blocks?" answer remembered for this session: None (ask), True, False.
         self._recolor_policy: bool | None = None
+        self._live_comments_dirty = False    # a saved session's .mat needs re-exporting
+        self._review_mat_stale = False
+        self._shown_comments: list[dict] = []
+        # Live time axis: stream time shown as 0. It's the start of the block
+        # being (or last) recorded, so live times match the saved comment times.
+        self._axis_zero = 0.0
+        self._block_on_screen = False      # is the last block's data in this run?
+        self._popup = None
         # The channel setup the user edits in the strips next to each plot.
         cfgmod.fill_colors(cfg.channels + cfg.spare_channels)
         self.rows = [ChannelRow(c) for c in cfg.channels + cfg.spare_channels]
@@ -86,6 +102,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self._rate_busy = False
         self._set_mode(LIVE)
         self._sync_setup_controls()
+        open_ = self.settings.value("comments_open", True, type=bool)
+        self.btn_comments.setChecked(open_)
+        self.comments_panel.setVisible(open_)
+        self.refresh_comments()
 
     # ======================================================================
     # UI construction
@@ -94,8 +114,11 @@ class MainWindow(QtWidgets.QMainWindow):
         tb = self.addToolBar("Controls")
         tb.setMovable(False)
         self.btn_run = QtWidgets.QPushButton("Start", checkable=True)
+        self.btn_run.setObjectName("start")
         self.btn_run.toggled.connect(self._toggle_run)
-        self.btn_rec = QtWidgets.QPushButton("● Record", checkable=True, enabled=False)
+        self.btn_rec = QtWidgets.QPushButton("Record", checkable=True, enabled=False)
+        self.btn_rec.setObjectName("record")
+        self.btn_rec.setIcon(style.dot_icon(style.RECORDING))
         self.btn_rec.toggled.connect(self._toggle_rec)
         # Editable: pick a preset or type any rate, then press Enter.
         self.rate_box = QtWidgets.QComboBox(editable=True)
@@ -104,33 +127,46 @@ class MainWindow(QtWidgets.QMainWindow):
         self.rate_box.setMinimumContentsLength(9)
         self.rate_box.lineEdit().editingFinished.connect(self._rate_entered)
         self.rate_box.activated.connect(lambda *_: self._rate_entered())
-        self.window_box = QtWidgets.QDoubleSpinBox(minimum=0.01, maximum=600, value=self.cfg.window_s,
-                                                   suffix=" s window", decimals=2)
+        self.window_box = WindowBox(minimum=0.01, maximum=600, value=self.cfg.window_s,
+                                    suffix=" s", decimals=2)
+        self.window_box.setToolTip("How many seconds the plots show")
+        self.window_box.setMinimumWidth(80)
         self.window_box.valueChanged.connect(self._window_changed)
-        self.comment_edit = QtWidgets.QLineEdit(placeholderText="Comment (Enter to add)")
+        # Only usable while recording, because that's when a comment can be saved.
+        self.comment_edit = QtWidgets.QLineEdit()
+        self.comment_edit.setAccessibleName("Comment")
+        self.comment_edit.setToolTip("Shortcut: press C to jump here")
+        self.comment_edit.setMinimumWidth(160)
         self.comment_edit.returnPressed.connect(self._add_comment)
+        self._set_comment_box(False)
         self.block_combo = QtWidgets.QComboBox()
         self.block_combo.setMinimumContentsLength(18)
         self.block_combo.currentIndexChanged.connect(self._show_review_block)
         self.btn_live = QtWidgets.QPushButton("Back to Live")
         self.btn_live.clicked.connect(self.back_to_live)
+        self.btn_comments = QtWidgets.QPushButton("Comments (0)", checkable=True)
+        self.btn_comments.setToolTip("Show or hide this block's comments")
+        self.btn_comments.toggled.connect(self._toggle_comments)
 
-        self._live_actions = [tb.addWidget(self.btn_run), tb.addWidget(self.btn_rec),
-                              tb.addWidget(QtWidgets.QLabel("  Sampling rate ")),
-                              tb.addWidget(self.rate_box), tb.addWidget(QtWidgets.QLabel(" "))]
-        self._review_actions = [tb.addWidget(QtWidgets.QLabel(" Block: ")), tb.addWidget(self.block_combo)]
+        self._live_actions = [tb.addWidget(self.btn_run), tb.addWidget(self.btn_rec), tb.addSeparator(),
+                              tb.addWidget(QtWidgets.QLabel("Sampling rate")), tb.addWidget(self.rate_box)]
+        self._review_actions = [tb.addWidget(QtWidgets.QLabel("Block")), tb.addWidget(self.block_combo)]
+        tb.addWidget(QtWidgets.QLabel("Window"))
         tb.addWidget(self.window_box)
-        self._live_actions.append(tb.addWidget(self.comment_edit))
+        self._live_actions += [tb.addSeparator(), tb.addWidget(self.comment_edit)]
         self._review_actions.append(tb.addWidget(self.btn_live))
         spacer = QtWidgets.QWidget()            # in live mode the comment box fills this space
         spacer.setSizePolicy(QtWidgets.QSizePolicy.Policy.Expanding, QtWidgets.QSizePolicy.Policy.Preferred)
         self._review_actions.append(tb.addWidget(spacer))
+        tb.addWidget(self.btn_comments)
         self.btn_theme = QtWidgets.QToolButton()
         self.btn_theme.setAutoRaise(True)
         self.btn_theme.setIconSize(QtCore.QSize(20, 20))
         self.btn_theme.clicked.connect(self.toggle_plot_theme)
         tb.addWidget(self.btn_theme)
         self._update_theme_button()
+        sc = QtGui.QShortcut(QtGui.QKeySequence("C"), self)
+        sc.activated.connect(self._focus_comment)
 
         central = QtWidgets.QWidget()
         lay = QtWidgets.QVBoxLayout(central)
@@ -157,7 +193,17 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.scroll = QtWidgets.QScrollBar(QtCore.Qt.Orientation.Horizontal)
         self.scroll.valueChanged.connect(self._scrolled)
-        lay.addWidget(self.plot_area, 1)
+        self.comments_panel = CommentsPanel()
+        self.comments_panel.edited.connect(self.edit_comment)
+        self.comments_panel.deleted.connect(self.delete_comment)
+        self.comments_panel.jump.connect(self.jump_to)
+        self.comments_panel.closed.connect(lambda: self.btn_comments.setChecked(False))
+        row = QtWidgets.QHBoxLayout()
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(0)
+        row.addWidget(self.plot_area, 1)
+        row.addWidget(self.comments_panel)
+        lay.addLayout(row, 1)
         lay.addWidget(self.channel_bar)
         lay.addWidget(self.scroll)
         self.setCentralWidget(central)
@@ -287,7 +333,10 @@ class MainWindow(QtWidgets.QMainWindow):
                               tooltip="Change this channel's colour in every block of this session")
             self.review_color_btns.append(btn)
             h.addWidget(btn, 0)
-            h.addWidget(self._new_plot(name, unit, color), 1)
+            pw = self._new_plot(name, unit, color)
+            pw.setToolTip("Double-click to add a comment")
+            pw.scene().sigMouseClicked.connect(lambda ev, pw=pw: self._plot_clicked(pw, ev))
+            h.addWidget(pw, 1)
             self.plot_layout.addWidget(row_w, 1)
         self._finish_plots()
 
@@ -623,8 +672,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self.scroll.setVisible(mode == REVIEW)
         self.channel_bar.setVisible(mode == LIVE)
         self.wiring_menu.setEnabled(mode == LIVE and not self.recorder.recording)
+        fw = self.focusWidget()
+        if fw is not None:      # don't leave a box (e.g. Window) highlighted after switching
+            fw.clearFocus()
         self._update_title()
         self._update_wiring_label()
+        if hasattr(self, "comments_panel"):
+            self.refresh_comments()
 
     def _update_title(self):
         if self.mode == REVIEW and self.review_dir is not None:
@@ -689,6 +743,8 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def back_to_live(self):
         """Leave review. The next Record starts a new untitled session."""
+        self._flush_review_mat()
+        self._live_comments_dirty = False
         self.review_dir, self.review_blocks, self.review_block = None, [], None
         self.session_dir, self.blocks, self._exported_n = None, [], 0
         self.session_saved = False
@@ -883,6 +939,7 @@ class MainWindow(QtWidgets.QMainWindow):
             raise session.SessionError(f"{path} has no block_NNN.h5 files, so it isn't a session.")
         if self.btn_run.isChecked():
             self.btn_run.setChecked(False)
+        self._flush_review_mat()
         self.review_dir, self.review_blocks = path, blocks
         self._set_mode(REVIEW)
         self.block_combo.blockSignals(True)
@@ -939,6 +996,9 @@ class MainWindow(QtWidgets.QMainWindow):
             QtWidgets.QApplication.restoreOverrideCursor()
         if self.mode == LIVE:
             self._exported_n = len(self.blocks)
+            self._live_comments_dirty = False
+        else:
+            self._review_mat_stale = False
         self.statusBar().showMessage(f"Exported {len(blocks)} block(s) to {out}", 10000)
         return out
 
@@ -949,10 +1009,19 @@ class MainWindow(QtWidgets.QMainWindow):
         return self.review_dir if self.mode == REVIEW else self.session_dir
 
     def _autoexport_live(self):
-        if len(self.blocks) > self._exported_n:   # don't lose the .mat if they forgot
+        # Don't lose the .mat if they forgot: new blocks, or comments edited since.
+        if len(self.blocks) > self._exported_n or self._live_comments_dirty:
             prev_mode, self.mode = self.mode, LIVE
-            self.export()
+            if self.export() is not None:
+                self._live_comments_dirty = False
             self.mode = prev_mode
+
+    def _flush_review_mat(self):
+        """After editing comments in review, update the session's .mat if it has one."""
+        if self.mode == REVIEW and self._review_mat_stale and self.review_dir is not None:
+            if (self.review_dir / f"{self.review_dir.name}.mat").exists():
+                self.export()
+        self._review_mat_stale = False
 
     # -- recent sessions ---------------------------------------------------
     def recent_sessions(self) -> list[str]:
@@ -1005,11 +1074,9 @@ class MainWindow(QtWidgets.QMainWindow):
             if k < len(self.curves):
                 self._set_curve_color(k, color)
             btn.set_color(color)
-        self._clear_markers()
         for curve, y in zip(self.curves, blk["data"]):
             curve.setData(blk["t"], y)
-        for t, text in blk["comments"]:
-            self._add_marker(t, text)
+        self.refresh_comments()
         self._update_scroll_range()
         self._update_wiring_label()
         self.plots[0].setXRange(0, min(self.window_box.value(), max(blk["duration_s"], 1e-3)), padding=0)
@@ -1070,6 +1137,9 @@ class MainWindow(QtWidgets.QMainWindow):
                 return
             self.buf_t = np.empty(0)
             self.buf_y = np.empty((len(self.cfg.channels), 0))
+            self._clear_markers()
+            self._axis_zero = 0.0
+            self._block_on_screen = False
             self.btn_run.setText("Stop")
             self.btn_rec.setEnabled(True)
             self.timer.start()
@@ -1090,16 +1160,27 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.session_saved = False
             path = session.next_block_path(self.session_dir)
             path = self.recorder.start(path)
+            # Time 0 = this block's first sample. Until it arrives, use the latest
+            # sample; _refresh corrects it (by at most one read) once it's known.
+            self._set_axis_zero(self.recorder.last_t)
+            self._block_on_screen = True
             self.blocks.append(path)
             self._update_title()
             self.statusBar().showMessage(f"Recording {path.name} in {self.session_dir}")
-            self.btn_rec.setText("■ Stop recording")
+            self.btn_rec.setText("Stop recording · 0:00")
+            self.btn_rec.setIcon(style.dot_icon("#ffffff", square=True))
             self._lock_channels(True)
+            self._set_comment_box(True)
         else:
             self.recorder.stop()
             self._lock_channels(False)
             self.statusBar().showMessage(f"Saved {self.recorder.path.name}", 10000)
-            self.btn_rec.setText("● Record")
+            self.btn_rec.setText("Record")
+            self.btn_rec.setIcon(style.dot_icon(style.RECORDING))
+            self._set_comment_box(False)
+        # Starting a block keeps the previous block's comment lines: its data is
+        # still on screen (now at negative times), and they scroll off with it.
+        self.refresh_comments(redraw_markers=not on)
 
     def _lock_channels(self, locked: bool):
         for st in self.strips:
@@ -1111,23 +1192,148 @@ class MainWindow(QtWidgets.QMainWindow):
     def _redraw_live(self):
         if self.buf_t.size and self.buf_y.shape[0] == len(self.curves):
             for ch, curve, y in zip(self.cfg.channels, self.curves, self.buf_y):
-                curve.setData(self.buf_t, ch.to_units(y))
+                curve.setData(self.buf_t - self._axis_zero, ch.to_units(y))
+
+    def _set_axis_zero(self, zero: float) -> None:
+        """Change which stream time the live axis shows as 0; comment lines move with it."""
+        delta = self._axis_zero - zero
+        if delta:
+            for i, (t, lines) in enumerate(self.markers):
+                for ln in lines:
+                    ln.setValue(ln.value() + delta)
+                self.markers[i] = (t + delta, lines)
+        self._axis_zero = zero
 
     def _add_comment(self):
         text = self.comment_edit.text().strip()
-        if not text or not self.backend.running:
+        if not text or not self.recorder.recording:
             return
-        t = self.recorder.add_comment(text)
-        self._add_marker(t, text)
+        t = self.recorder.add_comment(text)      # saved to the block straight away
+        self._add_marker(t - self._axis_zero, text)
         self.comment_edit.clear()
+        self.refresh_comments(redraw_markers=False)
+
+    def _set_comment_box(self, recording: bool):
+        self.comment_edit.setEnabled(recording)
+        self.comment_edit.setPlaceholderText("Press Enter to add comment" if recording
+                                             else "Press Record to add comments")
+
+    def _focus_comment(self):
+        if self.mode == LIVE and self.comment_edit.isEnabled():
+            self.comment_edit.setFocus()
+            self.comment_edit.selectAll()
+
+    # -- comments panel ----------------------------------------------------
+    def _toggle_comments(self, on: bool):
+        self.comments_panel.setVisible(on)
+        self.settings.setValue("comments_open", on)
+
+    def _comment_block(self) -> Path | None:
+        """The block whose comments the panel shows: the reviewed block in review;
+        in live, the block being recorded, else the last one recorded."""
+        if self.mode == REVIEW:
+            i = self.block_combo.currentIndex()
+            return self.review_blocks[i] if 0 <= i < len(self.review_blocks) else None
+        if self.recorder.recording:
+            return self.recorder.path
+        return self.blocks[-1] if self.blocks else None
+
+    def _read_block_comments(self, block: Path) -> list[dict]:
+        if self.recorder.recording and block == self.recorder.path:
+            return self.recorder.get_comments()
+        try:
+            return session.read_comments(block)
+        except Exception:
+            return []
+
+    def refresh_comments(self, redraw_markers: bool = True) -> None:
+        """Reload the panel (and the comment lines on the plots) from the block file."""
+        block = self._comment_block()
+        self._shown_comments = self._read_block_comments(block) if block else []
+        self.comments_panel.set_comments(f"Comments · {block.stem}" if block else "Comments",
+                                         [(c["t"], c["text"]) for c in self._shown_comments],
+                                         editable=block is not None)
+        self.btn_comments.setText(f"Comments ({len(self._shown_comments)})")
+        if redraw_markers:
+            self._redraw_comment_markers()
+
+    def _redraw_comment_markers(self):
+        self._clear_markers()
+        if self.mode == REVIEW:
+            offset = 0.0
+        elif (self._block_on_screen and self.recorder.path is not None
+              and self._comment_block() == self.recorder.path):
+            offset = self.recorder.block_start - self._axis_zero
+        else:
+            return                               # that block isn't on screen
+        for c in self._shown_comments:
+            self._add_marker(c["t"] + offset, c["text"])
+
+    def _save_comments(self, comments: list[dict]) -> None:
+        block = self._comment_block()
+        if block is None:
+            return
+        try:
+            if self.recorder.recording and block == self.recorder.path:
+                self.recorder.set_comments(comments)
+            else:
+                session.write_comments(block, comments)
+        except Exception as e:
+            self._channel_message(f"Couldn't save the comment change in {block.name} "
+                                  f"(read-only or open elsewhere?): {e}")
+        if self.mode == REVIEW:
+            self._review_mat_stale = True
+        elif self.session_saved:
+            self._live_comments_dirty = True
+        self.refresh_comments()
+
+    def edit_comment(self, row: int, text: str) -> None:
+        comments = [dict(c) for c in self._shown_comments]
+        if 0 <= row < len(comments) and text.strip():
+            comments[row]["text"] = text.strip()
+            self._save_comments(comments)
+
+    def delete_comment(self, row: int) -> None:
+        if 0 <= row < len(self._shown_comments):
+            self._save_comments([c for i, c in enumerate(self._shown_comments) if i != row])
+
+    def add_comment_at(self, t: float, text: str) -> None:
+        """Add a comment at time t (s from the block's start), e.g. from a double-click in review."""
+        if not text.strip() or self._comment_block() is None:
+            return
+        fs = (self.review_block or {}).get("sample_rate") if self.mode == REVIEW else self.backend.actual_rate
+        fs = fs or self.cfg.sample_rate
+        self._save_comments(self._shown_comments + [
+            {"t": float(t), "sample_index": int(round(t * fs)), "text": text.strip()}])
+
+    def jump_to(self, t: float) -> None:
+        """Centre the review plots on a comment."""
+        if self.mode != REVIEW or not self.plots:
+            return
+        win = self.window_box.value()
+        start = max(0.0, t - win / 2)
+        self.plots[0].setXRange(start, start + win, padding=0)
+
+    def _plot_clicked(self, pw, ev):
+        if self.mode != REVIEW or not ev.double() or self.review_block is None:
+            return
+        vb = pw.getPlotItem().vb
+        if not vb.sceneBoundingRect().contains(ev.scenePos()):
+            return
+        t = min(max(0.0, vb.mapSceneToView(ev.scenePos()).x()), self.review_block["duration_s"])
+        self._popup = CommentPopup(self, t)
+        self._popup.submitted.connect(self.add_comment_at)
+        self._popup.show_at(QtGui.QCursor.pos())
 
     def _add_marker(self, t: float, text: str):
         lines = []
+        # Stagger labels over three heights so nearby comments don't print on top of each other.
+        label_y = 0.92 - 0.09 * (len(self.markers) % 3)
         for p in self.plots:
             mc = theme.THEMES[self.plot_mode].marker
             ln = pg.InfiniteLine(t, angle=90, pen=pg.mkPen(mc, style=QtCore.Qt.PenStyle.DashLine),
                                  label=text if p is self.plots[0] else None,
-                                 labelOpts={"position": 0.9, "color": mc})
+                                 labelOpts={"position": label_y, "color": mc})
             p.addItem(ln)
             lines.append(ln)
         self.markers.append((t, lines))
@@ -1156,12 +1362,15 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         self.buf_t = np.concatenate([self.buf_t, *ts])[-self.cap:]
         self.buf_y = np.concatenate([self.buf_y, *ys], axis=1)[:, -self.cap:]
-        t_end = self.buf_t[-1]
+        if self.recorder.recording and self.recorder.block_started:
+            self._set_axis_zero(self.recorder.block_start)   # exact block start
+        x = self.buf_t - self._axis_zero
+        t_end = x[-1]
         for ch, curve, y in zip(self.cfg.channels, self.curves, self.buf_y):
-            curve.setData(self.buf_t, ch.to_units(y))
+            curve.setData(x, ch.to_units(y))
         self.plots[0].setXRange(t_end - self.window_box.value(), t_end, padding=0)
         # drop markers that scrolled off
-        t_min = self.buf_t[0]
+        t_min = x[0]
         while self.markers and self.markers[0][0] < t_min:
             _, lines = self.markers.pop(0)
             for p, ln in zip(self.plots, lines):
@@ -1170,7 +1379,9 @@ class MainWindow(QtWidgets.QMainWindow):
         lag = self.display_q.qsize()
         msg = f"rate {rate:,.1f} Hz/ch" + ("" if self.backend.hardware_timed else " (software-timed!)")
         if self.recorder.recording and self.backend.hardware_timed:
-            msg += f" | recorded {self.recorder.samples_written / max(rate, 1e-9):,.1f} s"
+            secs = self.recorder.samples_written / max(rate, 1e-9)
+            msg += f" | recorded {secs:,.1f} s"
+            self.btn_rec.setText(f"Stop recording · {int(secs) // 60}:{int(secs) % 60:02d}")
         if lag > 5:
             msg += f" | display lagging ({lag} chunks queued)"
         self.status.setText(msg)
@@ -1183,6 +1394,7 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         self.recorder.stop()
         self.backend.stop()
+        self._flush_review_mat()
         if self.session_saved:
             self._autoexport_live()
         self.recorder.close()   # end the writer thread before Qt and h5py shut down
@@ -1210,6 +1422,7 @@ def run(cfg: Config, config_path: str | Path | None = None):
         import ctypes
         ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("neusci.daq.visualizer")
     app.setWindowIcon(app_icon())
+    style.apply(app)
     w = MainWindow(cfg, config_path=config_path)
     w.resize(1300, 200 + 180 * len(cfg.channels))
     w.show()

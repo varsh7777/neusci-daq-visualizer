@@ -93,6 +93,30 @@ class Recorder:
                 self._file.attrs["colors"] = list(colors)
                 self._file.flush()
 
+    @property
+    def block_started(self) -> bool:
+        """True once the first sample of the current block has arrived."""
+        return self._t_offset is not None
+
+    @property
+    def block_start(self) -> float:
+        """Stream time (s) of the first sample of the current or last block."""
+        return self._t_offset or 0.0
+
+    def get_comments(self) -> list[dict]:
+        """Comments of the block being recorded, as [{t, sample_index, text}]."""
+        with self._lock:
+            if self._file is None:
+                return []
+            return _decode_comments(self._file["comments"][:])
+
+    def set_comments(self, comments: list[dict]) -> None:
+        """Replace the comments of the block being recorded (edit or delete)."""
+        with self._lock:
+            if self._file is not None:
+                _write_comments(self._file, comments)
+                self._file.flush()
+
     def add_comment(self, text: str) -> float:
         """Comment at the latest acquired sample. Returns its stream time (s)."""
         with self._lock:
@@ -124,6 +148,25 @@ class Recorder:
                     tds.resize((n0 + k,))
                     tds[n0:] = chunk.t - self._t_offset
                 self.samples_written = n0 + k
+
+
+def _decode_comments(rows) -> list[dict]:
+    out = []
+    for c in rows:
+        text = c["text"]
+        out.append({"t": float(c["t"]), "sample_index": int(c["sample_index"]),
+                    "text": text.decode() if isinstance(text, bytes) else str(text)})
+    return out
+
+
+def _write_comments(f: h5py.File, comments: list[dict]) -> None:
+    """Rewrite a block's comments dataset (sorted by time)."""
+    rows = sorted(comments, key=lambda c: c["t"])
+    if "comments" in f:
+        del f["comments"]
+    ds = f.create_dataset("comments", shape=(len(rows),), maxshape=(None,), dtype=_COMMENT_DT)
+    for i, c in enumerate(rows):
+        ds[i] = (float(c["t"]), int(c["sample_index"]), str(c["text"]))
 
 
 def load_recording(path: str | Path) -> dict:

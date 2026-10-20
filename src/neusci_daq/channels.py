@@ -33,7 +33,7 @@ class ColorButton(QtWidgets.QToolButton):
         super().__init__()
         self._on_pick = on_pick
         self.setToolTip(tooltip)
-        self.setFixedWidth(10)
+        self.setFixedWidth(8)
         self.setSizePolicy(QtWidgets.QSizePolicy.Policy.Fixed, QtWidgets.QSizePolicy.Policy.Expanding)
         self.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
         self.set_color(color, enabled_look)
@@ -42,7 +42,7 @@ class ColorButton(QtWidgets.QToolButton):
     def set_color(self, color: str, enabled_look: bool = True) -> None:
         self.color = color
         self.setStyleSheet(f"QToolButton {{ background: {color if enabled_look else OFF_COLOR}; "
-                           "border: none; }")
+                           "border: none; border-radius: 0; padding: 0; }")
 
     def _show_menu(self):
         menu = QtWidgets.QMenu(self)
@@ -91,8 +91,8 @@ class ChannelStrip(QtWidgets.QFrame):
         body = QtWidgets.QWidget()
         outer.addWidget(body, 1)
         lay = QtWidgets.QGridLayout(body)
-        lay.setContentsMargins(8, 4, 4, 4)
-        lay.setVerticalSpacing(4)
+        lay.setContentsMargins(10, 6, 6, 6)
+        lay.setVerticalSpacing(6)
 
         self.on = QtWidgets.QCheckBox()
         self.on.setChecked(row.ch.enabled)
@@ -107,6 +107,8 @@ class ChannelStrip(QtWidgets.QFrame):
         self.input.setToolTip("Which DAQ input this channel reads"
                               + (" (DIFF: aiN is measured against ai(N+4))" if diff else ""))
         self.remove = QtWidgets.QToolButton(text="✕")
+        self.remove.setObjectName("remove")
+        self.remove.setFixedSize(26, 26)
         self.remove.setToolTip("Remove this channel")
         self._can_remove = can_remove
         self.remove.setEnabled(can_remove)
