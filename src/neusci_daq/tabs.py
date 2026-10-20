@@ -29,6 +29,9 @@ class _Pane(QtWidgets.QWidget):
         self.bar = QtWidgets.QTabBar()
         self.bar.setDrawBase(False)
         self.bar.setExpanding(False)
+        # No ◀ ▶ scroll arrows when the tabs don't fit; shorten the names ("Analy…") instead.
+        self.bar.setUsesScrollButtons(False)
+        self.bar.setElideMode(QtCore.Qt.TextElideMode.ElideRight)
         self.bar.setFocusPolicy(QtCore.Qt.FocusPolicy.NoFocus)
         for i in ids:
             self.bar.addTab(names[i])

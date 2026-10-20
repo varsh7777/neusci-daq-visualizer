@@ -20,6 +20,16 @@ def test_starts_on_acquisition_with_four_tabs(win):
         ["Acquisition", "Stimulator", "Scope view", "Analysis"]
 
 
+def test_tab_bars_never_show_scroll_arrows(app, win):
+    win.resize(1024, 600)
+    win.show()
+    win.tabs.set_layout(SIDE)                                  # narrowest tab bars
+    pump(app, 0.05)
+    for pane in win.tabs.panes:
+        assert not pane.bar.usesScrollButtons()
+        assert not any(b.isVisible() for b in pane.bar.findChildren(QtWidgets.QToolButton))
+
+
 def test_pick_tabs_and_split(win):
     win.tabs.pick(0, "stim")
     assert shown(win) == ["stim"]
