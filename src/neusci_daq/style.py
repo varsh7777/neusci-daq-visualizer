@@ -62,7 +62,7 @@ QMenu::item:selected {{ background: {t['button']}; }}
 QMenu::item:disabled {{ color: {t['disabled_ink']}; }}
 QMenu::separator {{ height: 1px; background: {t['line']}; margin: 4px 8px; }}
 QToolTip {{ background: {t['panel']}; color: {t['ink']}; border: 1px solid {t['line']}; }}
-QToolBar {{ border: none; border-bottom: 1px solid {t['line']}; padding: 6px 8px; spacing: 8px; }}
+QToolBar {{ border: none; border-bottom: 1px solid {t['line']}; padding: 6px 8px; spacing: 6px; }}
 QToolBar::separator {{ background: {t['line']}; width: 1px; margin: 6px 4px; }}
 QStatusBar {{ border-top: 1px solid {t['line']}; color: {t['muted']}; }}
 QStatusBar QLabel {{ color: {t['muted']}; }}

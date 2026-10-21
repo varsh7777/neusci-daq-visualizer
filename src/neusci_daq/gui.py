@@ -60,6 +60,15 @@ class WindowBox(QtWidgets.QDoubleSpinBox):
     def textFromValue(self, v: float) -> str:
         return f"{v:g}"
 
+    def sizeHint(self) -> QtCore.QSize:
+        # Qt sizes the box for "600.00 s" (the maximum, with every decimal); size it for
+        # what's actually typed, like "600 s", so the toolbar fits on a laptop.
+        h = super().sizeHint()
+        return QtCore.QSize(min(h.width(), 76), h.height())
+
+    def minimumSizeHint(self) -> QtCore.QSize:
+        return self.sizeHint()
+
 
 class _CommentEdit(QtWidgets.QLineEdit):
     """Asks the toolbar for little width, so nothing gets pushed into its overflow
@@ -67,7 +76,7 @@ class _CommentEdit(QtWidgets.QLineEdit):
 
     def sizeHint(self) -> QtCore.QSize:
         h = super().sizeHint()
-        return QtCore.QSize(110, h.height())
+        return QtCore.QSize(90, h.height())
 
 
 class MainWindow(QtWidgets.QMainWindow):
@@ -153,13 +162,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self.window_box = WindowBox(minimum=0.01, maximum=600, value=self.cfg.window_s,
                                     suffix=" s", decimals=2)
         self.window_box.setToolTip("How many seconds the plots show")
-        self.window_box.setMinimumWidth(80)
+        self.window_box.setMinimumWidth(76)
         self.window_box.valueChanged.connect(self._window_changed)
         # Only usable while recording, because that's when a comment can be saved.
         self.comment_edit = _CommentEdit()
         self.comment_edit.setAccessibleName("Comment")
         self.comment_edit.setToolTip("Shortcut: press C to jump here")
-        self.comment_edit.setMinimumWidth(110)
+        self.comment_edit.setMinimumWidth(90)
         self.comment_edit.returnPressed.connect(self._add_comment)
         self._set_comment_box(False)
         self.block_combo = QtWidgets.QComboBox()
@@ -221,14 +230,15 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btn_theme.setAutoRaise(True)
         self.btn_theme.setIconSize(QtCore.QSize(20, 20))
         self.btn_theme.clicked.connect(self.toggle_plot_theme)
-        # Split buttons and the light/dark toggle sit at the right end of the tab bar
-        # (placed once the tabs exist), which keeps the toolbar narrow enough for laptops.
+        # Split buttons and the light/dark toggle sit at the right end of the toolbar,
+        # on the same row as Start and Record, and show on every tab.
         self.tab_corner = QtWidgets.QWidget()
         cl2 = QtWidgets.QHBoxLayout(self.tab_corner)
-        cl2.setContentsMargins(0, 2, 0, 2)
+        cl2.setContentsMargins(0, 0, 0, 0)
         cl2.setSpacing(6)
         cl2.addWidget(self.split_group)
         cl2.addWidget(self.btn_theme)
+        self._tb_corner = A(self.tab_corner)
         self._update_theme_button()
         sc = QtGui.QShortcut(QtGui.QKeySequence("C"), self)
         sc.activated.connect(self._focus_comment)
@@ -289,12 +299,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self.tabs = TabArea([
             ("acq", "Acquisition", central),
             ("stim", "Stimulator", self.stim_page),
-            ("scope", "Scope view", placeholder("Scope view", "Coming soon: overlay and average the pages "
-                                                              "around each stimulus.")),
+            ("trials", "Trials", placeholder("Trials", "Coming soon: overlay and average the pages "
+                                                      "around each stimulus.")),
             ("analysis", "Analysis", placeholder("Analysis", "Coming soon.")),
         ])
         self.tabs.changed.connect(self._tabs_changed)
-        self.tabs.set_corner(self.tab_corner)
         self.setCentralWidget(self.tabs)
 
         self.status = QtWidgets.QLabel()
@@ -545,8 +554,7 @@ class MainWindow(QtWidgets.QMainWindow):
         busy = self.stim_out is not None and self.stim_out.busy
         on = self.repeating or busy
         if on:
-            self.stim_chip_text.setText(f"Stimulating · {self.stim_repeat_s:g} s" if self.repeating
-                                        else "Stimulating")
+            self.stim_chip_text.setText("Stimulating")      # the interval is in the tooltip
             self.stim_chip.setToolTip(f"Repeating every {self.stim_repeat_s:g} s" if self.repeating
                                       else "A stimulus is being sent")
         if self._tb_chip.isVisible() != on:

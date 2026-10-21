@@ -1,4 +1,4 @@
-"""Tabs across the top (Acquisition, Stimulator, Scope view, Analysis), with an
+"""Tabs across the top (Acquisition, Stimulator, Trials, Analysis), with an
 optional split: two tabs side by side or one above the other.
 
 Each page is a single widget, so it can only be in one half at a time. Picking
@@ -82,16 +82,10 @@ class TabArea(QtWidgets.QWidget):
             p.picked.connect(self.pick)
             self.splitter.addWidget(p)
         lay.addWidget(self.splitter)
-        self._corner: QtWidgets.QWidget | None = None
         self._hold = QtWidgets.QWidget()          # parks pages that aren't shown
         self._hold.hide()
         for w in self.pages.values():
             w.setParent(self._hold)
-        self._place()
-
-    def set_corner(self, widget: QtWidgets.QWidget) -> None:
-        """Controls shown at the right end of the (last visible) tab bar."""
-        self._corner = widget
         self._place()
 
     # -- what's visible --------------------------------------------------------
@@ -154,11 +148,6 @@ class TabArea(QtWidgets.QWidget):
             else:
                 pane.hide()
                 pane.page_id = None
-        if self._corner is not None:
-            last = self.panes[len(vis) - 1]
-            if self._corner.parent() is not last.head_layout.parentWidget():
-                last.head_layout.addWidget(self._corner)
-            self._corner.show()
         if self.split:
             total = max(2, sum(self.splitter.sizes()) or 2)
             self.splitter.setSizes([total // 2, total - total // 2])

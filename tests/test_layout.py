@@ -17,7 +17,7 @@ def shown(w):
 def test_starts_on_acquisition_with_four_tabs(win):
     assert shown(win) == ["acq"]
     assert [win.tabs.panes[0].bar.tabText(i) for i in range(4)] == \
-        ["Acquisition", "Stimulator", "Scope view", "Analysis"]
+        ["Acquisition", "Stimulator", "Trials", "Analysis"]
 
 
 def test_tab_bars_never_show_scroll_arrows(app, win):
@@ -35,8 +35,8 @@ def test_pick_tabs_and_split(win):
     assert shown(win) == ["stim"]
     win.tabs.set_layout(SIDE)
     assert shown(win) == ["stim", "acq"] and win.split_buttons[SIDE].isChecked()
-    win.tabs.pick(1, "scope")
-    assert shown(win) == ["stim", "scope"]
+    win.tabs.pick(1, "trials")
+    assert shown(win) == ["stim", "trials"]
     win.tabs.set_layout(STACKED)
     assert win.tabs.splitter.orientation().name == "Vertical"
     win.tabs.set_layout(ONE)
@@ -55,7 +55,7 @@ def test_open_stim_window_shows_the_tab(win):
     assert win.tabs.is_visible("stim")
     win.tabs.pick(0, "acq")
     win.tabs.set_layout(SIDE)
-    win.tabs.pick(1, "scope")
+    win.tabs.pick(1, "trials")
     win.open_stim_window()                                   # puts it in the second half
     assert shown(win) == ["acq", "stim"]
 
@@ -200,9 +200,9 @@ def test_chip_shows_on_every_tab_while_repeating_and_stops_it(app, win):
     assert not win.stim_chip.isVisible()
     win.stim_page.btn_repeat.click()
     pump(app, 0.05)
-    assert win.stim_chip.isVisible() and "0.2 s" in win.stim_chip_text.text()
+    assert win.stim_chip.isVisible() and win.stim_chip_text.text() == "Stimulating"
     assert "every 0.2 s" in win.stim_chip.toolTip()
-    win.tabs.pick(0, "scope")                                # still visible on another tab
+    win.tabs.pick(0, "trials")                                # still visible on another tab
     pump(app, 0.05)
     assert win.stim_chip.isVisible()
     win.btn_chip_stop.click()
@@ -246,35 +246,53 @@ def test_stimulator_tab_shows_the_stimulus_that_fires(win):
     assert (s.amplitude_v, s.width_ms, s.count, s.interval_ms) == (2, 4, 4, 60)
 
 
-def test_everything_fits_on_a_1024_px_wide_window(app, win):
-    """A 1280 px laptop at 125% scaling is about 1024 px wide."""
-    win.resize(1024, 640)
+@pytest.mark.parametrize("mode", [style.DARK, style.LIGHT])
+def test_everything_fits_on_a_1024_px_wide_window(app, win, mode):
+    """A 1280 px laptop at 125% scaling is about 1024 px wide. Uses the real stylesheet:
+    unstyled widgets are narrower, so without it this passes when the app doesn't fit."""
+    old_sheet, old_pal = app.styleSheet(), app.palette()
+    try:
+        style.apply(app, mode)
+        win.resize(1024, 640)
+        win.show()
+        win.set_stimulus(Stimulus(amplitude_v=1, width_ms=1))
+        win.btn_run.setChecked(True)
+        pump(app, 0.2)
+        win.btn_rec.setChecked(True)                           # longest Record text
+        win.stim_repeat_s = 12.5
+        win.set_repeat(True)                                   # chip showing too
+        win.btn_comments.setText("Comments (88)")              # longest button text
+        pump(app, 0.2)
+        for w in (win.btn_run, win.btn_rec, win.rate_box, win.window_box, win.comment_edit,
+                  win.stim_chip, win.btn_comments, win.btn_theme, win.split_group):
+            assert w.isVisible(), w                            # not in the overflow menu
+            right = w.mapTo(win, w.rect().topRight()).x()
+            assert right < win.width(), w
+        win.stop_stimulus()
+        win.btn_rec.setChecked(False)
+        win.btn_run.setChecked(False)
+    finally:
+        style._applied["mode"] = None
+        app.setStyleSheet(old_sheet)
+        app.setPalette(old_pal)
+
+
+def test_split_and_theme_controls_sit_on_the_toolbar_row(app, win):
+    """Same row as Start and Record, at the right end, on every tab and in split view."""
+    win.resize(1300, 600)
     win.show()
-    win.set_stimulus(Stimulus(amplitude_v=1, width_ms=1))
-    win.btn_run.setChecked(True)
-    pump(app, 0.2)
-    win.btn_rec.setChecked(True)
-    win.stim_repeat_s = 12.5                                   # longest chip text
-    win.set_repeat(True)                                       # chip showing too
-    win.btn_comments.setText("Comments (88)")                  # longest button text
-    pump(app, 0.2)
-    for w in (win.btn_run, win.btn_rec, win.rate_box, win.window_box, win.comment_edit,
-              win.stim_chip, win.btn_comments, win.btn_theme, win.split_group):
-        assert w.isVisible(), w                                # not in the overflow menu
-        right = w.mapTo(win, w.rect().topRight()).x()
-        assert right < win.width(), w
-    win.stop_stimulus()
-    win.btn_rec.setChecked(False)
-    win.btn_run.setChecked(False)
-
-
-def test_split_and_theme_controls_follow_the_last_tab_bar(win):
-    corner = win.tab_corner
-    assert corner.parent() is win.tabs.panes[0].head_layout.parentWidget()
-    win.tabs.set_layout(SIDE)
-    assert corner.parent() is win.tabs.panes[1].head_layout.parentWidget()
-    win.tabs.set_layout(ONE)
-    assert corner.parent() is win.tabs.panes[0].head_layout.parentWidget()
+    for pick, mode in (("acq", ONE), ("stim", ONE), ("trials", SIDE)):
+        win.tabs.pick(0, pick)
+        win.tabs.set_layout(mode)
+        pump(app, 0.05)
+        assert win.split_group.isVisible() and win.btn_theme.isVisible()
+        mid = lambda w: w.mapTo(win, w.rect().center()).y()
+        assert abs(mid(win.split_group) - mid(win.btn_run)) <= 1
+        assert abs(mid(win.btn_theme) - mid(win.btn_run)) <= 1
+        right = win.btn_theme.mapTo(win, win.btn_theme.rect().topRight()).x()
+        assert right > win.width() - 40                      # right end of the toolbar
+    for pane in win.tabs.panes:                              # nothing left on the tab bars
+        assert win.tab_corner.parent() is not pane.head_layout.parentWidget()
 
 
 def test_long_comment_labels_are_shortened_on_the_plot(app, win):
