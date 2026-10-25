@@ -403,3 +403,16 @@ def test_protocol_is_remembered(win, tmp_path):
     from neusci_daq.trialspage import TrialsPage
     again = TrialsPage(win)
     assert again.protocol.repeats == 7
+
+
+def test_settings_rows_have_space_between_their_parts(app, win):
+    tp = win.trials_page
+    win.resize(1300, 700)
+    win.show()
+    win.tabs.pick(0, "trials")
+    pump(app, 0.2)
+    gap = lambda a, b: b.mapTo(win, b.rect().topLeft()).x() - a.mapTo(win, a.rect().topRight()).x()
+    assert gap(tp.name, tp.btn_save) >= 8 and gap(tp.btn_save, tp.btn_load) >= 8
+    assert gap(tp.shape, tp.btn_edit_stim) >= 8
+    assert gap(tp.before, tp.after) >= 8 + 30          # "before," sits between them
+    assert gap(tp.align, tp.btn_monitor) >= 8

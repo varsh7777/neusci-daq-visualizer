@@ -6,6 +6,7 @@ Review mode: open a saved session and scroll through its blocks.
 File menu:
   New        start a blank session (asks first if the current one is unsaved)
   Open…      review a saved session
+  Open .mat File…  review a LabChart export (or one of ours); the file isn't changed
   Append…    keep recording new blocks into a saved session
   Save       first time: choose a name and location; afterwards: update the .mat
   Save As…   save a copy under a new name and continue with the copy
@@ -37,6 +38,7 @@ import pyqtgraph as pg
 from pyqtgraph.Qt import QtCore, QtGui, QtWidgets
 
 from . import config as cfgmod
+from . import matfile
 from . import session
 from . import stim as stimmod
 from . import style, theme
@@ -53,6 +55,7 @@ from .trialspage import TrialsPage
 from .tabs import ONE, SIDE, STACKED, TabArea, layout_icon
 
 LIVE, REVIEW = "live", "review"
+_SI_BASE = {"V", "A", "s", "Hz", "Ω", "ohm", "N", "Pa", "W", "m", "g", "T"}
 
 
 class WindowBox(QtWidgets.QDoubleSpinBox):
@@ -99,6 +102,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._exported_n = 0
         # Review session.
         self.review_dir: Path | None = None
+        self._review_source: Path | None = None   # the .mat an imported session came from
         self.review_blocks: list[Path] = []
         self.review_block: dict | None = None
         self.review_color_btns: list[ColorButton] = []
@@ -320,6 +324,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.act_new.setShortcut(QtGui.QKeySequence.StandardKey.New)
         self.act_open = m.addAction("&Open…", self.open_session_dialog)
         self.act_open.setShortcut(QtGui.QKeySequence.StandardKey.Open)
+        self.act_open_mat = m.addAction("Open .&mat File…", self.open_mat_dialog)
+        self.act_open_mat.setToolTip("Review a LabChart export, or a .mat this app exported. "
+                                     "The file itself is never changed.")
         self.act_append = m.addAction("&Append…", self.append_session_dialog)
         m.addSeparator()
         self.act_save = m.addAction("&Save", self.save)
@@ -368,7 +375,13 @@ class MainWindow(QtWidgets.QMainWindow):
         pw = pg.PlotWidget()
         p = pw.getPlotItem()
         self.plot_widgets.append(pw)
-        p.setLabel("left", name, units=unit)
+        if unit in _SI_BASE:
+            p.setLabel("left", name, units=unit)       # pyqtgraph adds m, µ, k as needed
+        else:
+            # A prefix on a unit that already has one (mV, µA) or isn't SI (mmHg)
+            # would read "kmV", so show it as it is.
+            p.setLabel("left", f"{name} ({unit})" if unit else name)
+            p.getAxis("left").enableAutoSIPrefix(False)
         p.getAxis("left").setWidth(70)   # same width on every plot, so time axes line up
         p.showGrid(x=True, y=True, alpha=0.2)
         # Peak downsampling keeps spikes visible when zoomed out.
@@ -426,6 +439,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.trials_page.sync()
 
     def _build_review_plots(self, names: list[str], units: list[str], colors: list[str]):
+        self._review_names = list(names)
         """Plots for a saved session: one per recorded channel, with only a colour bar."""
         self._clear_plot_area()
         self.review_color_btns = []
@@ -869,7 +883,9 @@ class MainWindow(QtWidgets.QMainWindow):
             self.refresh_comments()
 
     def _update_title(self):
-        if self.mode == REVIEW and self.review_dir is not None:
+        if self.mode == REVIEW and self._review_source is not None:
+            where = f"{self._review_source.name} (imported copy) — Review"
+        elif self.mode == REVIEW and self.review_dir is not None:
             where = f"{self.review_dir.name} — Review"
         elif self.session_dir is not None and self.session_saved:
             where = f"{self.session_dir.name} — Live"
@@ -881,7 +897,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _update_menu_state(self):
         recording = self.recorder.recording
-        for a in (self.act_new, self.act_open, self.act_append):
+        for a in (self.act_new, self.act_open, self.act_open_mat, self.act_append):
             a.setEnabled(not recording)
         self.act_save.setEnabled(self.mode == LIVE and bool(self.blocks) and not recording)
         self.act_save_as.setEnabled(bool(self._export_blocks()) and not recording)
@@ -934,6 +950,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._flush_review_mat()
         self._live_comments_dirty = False
         self.review_dir, self.review_blocks, self.review_block = None, [], None
+        self._review_source = None
         self.session_dir, self.blocks, self._exported_n = None, [], 0
         self.session_saved = False
         self._recolor_policy = None          # a new session asks again
@@ -979,6 +996,14 @@ class MainWindow(QtWidgets.QMainWindow):
         path = QtWidgets.QFileDialog.getExistingDirectory(self, "Open session folder", self._start_dir())
         if path:
             self._try(lambda: self.open_session(path), "Could not open session")
+
+    def open_mat_dialog(self):
+        if not self._leave_live():
+            return
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self, "Open .mat file", self._start_dir(), "LabChart / MATLAB export (*.mat);;All files (*)")
+        if path:
+            self._try(lambda: self.open_mat(path), "Could not open the .mat file")
 
     def append_session_dialog(self):
         if not self._leave_live():
@@ -1128,6 +1153,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if self.btn_run.isChecked():
             self.btn_run.setChecked(False)
         self._flush_review_mat()
+        self._review_source = None
         self.review_dir, self.review_blocks = path, blocks
         self._set_mode(REVIEW)
         self.block_combo.blockSignals(True)
@@ -1142,6 +1168,27 @@ class MainWindow(QtWidgets.QMainWindow):
         self._remember(path)
         self.statusBar().showMessage(f"Opened {path.name} ({len(blocks)} block(s)) for review", 10000)
         self._show_review_block(0)
+
+    def open_mat(self, path: str | Path) -> Path:
+        """Review a LabChart-style .mat. It's turned into a session folder under
+        <data_dir>/imported (reused if the .mat hasn't changed), so comments and
+        colours can be edited without touching the original file."""
+        path = Path(path)
+        try:
+            folder, notes = matfile.import_mat(path, Path(self.cfg.data_dir) / "imported")
+        except matfile.MatError as e:
+            raise session.SessionError(str(e)) from None
+        self.open_session(folder)
+        self._review_source = path
+        recent = [r for r in self.recent_sessions() if r != str(folder.resolve())]
+        self.settings.setValue("recent_sessions", session.add_recent(recent, path))
+        self._update_title()
+        msg = (f"Opened {path.name} ({len(self.review_blocks)} block(s)). The .mat itself isn't changed: "
+               f"comments and colours are kept in its imported copy, {folder}.")
+        if notes:
+            msg += " " + " ".join(notes)
+        self.statusBar().showMessage(msg, 20000)
+        return folder
 
     def append_session(self, path: str | Path, force: bool = False) -> Path:
         """Continue recording new blocks into an existing session."""
@@ -1234,6 +1281,14 @@ class MainWindow(QtWidgets.QMainWindow):
         self.recent_menu.addAction("Clear List", lambda: self.settings.setValue("recent_sessions", []))
 
     def open_recent(self, path: str):
+        if path.lower().endswith(".mat"):
+            if not Path(path).is_file():
+                self.settings.setValue("recent_sessions", [r for r in self.recent_sessions() if r != path])
+                QtWidgets.QMessageBox.warning(self, "File not found",
+                                              f"{path} no longer exists. It has been removed from the list.")
+            elif self._leave_live():
+                self._try(lambda: self.open_mat(path), "Could not open the .mat file")
+            return
         if not session.is_session(path):
             self.settings.setValue("recent_sessions", [r for r in self.recent_sessions() if r != path])
             QtWidgets.QMessageBox.warning(self, "Session not found",
@@ -1255,7 +1310,7 @@ class MainWindow(QtWidgets.QMainWindow):
             QtWidgets.QMessageBox.critical(self, "Could not read block", repr(e))
             return
         self.review_block = blk
-        names = [p.getAxis("left").labelText for p in self.plots]
+        names = getattr(self, "_review_names", None)
         if self.strips or names != blk["channel_names"] or len(self.plots) != len(blk["channel_names"]):
             self._build_review_plots(blk["channel_names"], blk["units"], blk["colors"])
         for k, (btn, color) in enumerate(zip(self.review_color_btns, blk["colors"])):
@@ -1762,6 +1817,12 @@ class MainWindow(QtWidgets.QMainWindow):
         if self.session_saved:
             self._autoexport_live()
         self.recorder.close()   # end the writer thread before Qt and h5py shut down
+        # Delete the plots now, in order. Left to Python's garbage collector, a
+        # pyqtgraph plot can be freed while Qt still has a layout pass queued for
+        # it, which crashes Qt (seen when windows are opened and closed repeatedly).
+        self._clear_plot_area()
+        self.stim_page.preview.setParent(None)
+        self.stim_page.preview.deleteLater()
         super().closeEvent(ev)
 
 

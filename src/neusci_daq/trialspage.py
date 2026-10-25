@@ -23,6 +23,7 @@ from . import stim as stimmod
 from . import style, theme
 from . import trials as T
 
+ROW_GAP = 8          # px between the parts of a settings row (box, button, label)
 B_COLORS = ("#E69F00", "#56B4E9", "#009E73", "#CC79A7", "#D55E00", "#0072B2", "#F0E442", "#999999")
 
 
@@ -297,11 +298,13 @@ class TrialsPage(QtWidgets.QWidget):
         self.btn_load = QtWidgets.QPushButton("Load…")
         self.btn_load.setToolTip("Load a saved protocol")
         name_row = QtWidgets.QHBoxLayout()
+        name_row.setSpacing(ROW_GAP)
         name_row.addWidget(self.name, 1)
         name_row.addWidget(self.btn_save)
         name_row.addWidget(self.btn_load)
         form.addRow("Protocol", name_row)
         shape_row = QtWidgets.QHBoxLayout()
+        shape_row.setSpacing(ROW_GAP)
         self.shape = QtWidgets.QComboBox()
         for key, label in stimmod.SHAPES.items():
             self.shape.addItem(label, key)
@@ -328,6 +331,7 @@ class TrialsPage(QtWidgets.QWidget):
         form2.setHorizontalSpacing(10)
         form2.setVerticalSpacing(8)
         rep_row = QtWidgets.QHBoxLayout()
+        rep_row.setSpacing(ROW_GAP)
         self.repeats = QtWidgets.QSpinBox(minimum=1, maximum=1000)
         self.repeats.setKeyboardTracking(False)
         self.rep_note = QtWidgets.QLabel("of each value")
@@ -342,6 +346,7 @@ class TrialsPage(QtWidgets.QWidget):
         self.gap.setToolTip("From the start of one trial to the start of the next")
         form2.addRow("Between", self.gap)
         win_row = QtWidgets.QHBoxLayout()
+        win_row.setSpacing(ROW_GAP)
         self.before = _spin(0, 10000, decimals=1, suffix=" ms", step=1, width=70)
         self.after = _spin(0.1, 10000, decimals=1, suffix=" ms", step=5, width=70)
         win_row.addWidget(self.before)
@@ -351,6 +356,7 @@ class TrialsPage(QtWidgets.QWidget):
         win_row.addStretch(1)
         form2.addRow("Show", win_row)
         align_row = QtWidgets.QHBoxLayout()
+        align_row.setSpacing(ROW_GAP)
         self.align = QtWidgets.QLabel()
         self.align.setWordWrap(True)
         self.btn_monitor = QtWidgets.QPushButton("Choose…")
@@ -518,6 +524,7 @@ class TrialsPage(QtWidgets.QWidget):
         for k, label in T.MEASURES.items():
             self.m_kind.addItem(label, k)
         rng = QtWidgets.QHBoxLayout()
+        rng.setSpacing(ROW_GAP)
         self.m_from = _spin(-10000, 10000, decimals=1, suffix=" ms", step=1, width=88)
         self.m_to = _spin(-10000, 10000, decimals=1, suffix=" ms", step=1, width=88)
         rng.addWidget(self.m_from)
