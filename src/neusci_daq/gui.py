@@ -49,6 +49,7 @@ from .recorder import Recorder
 from .stim import Stimulus
 from .stimout import make_output
 from .stimwindow import StimPage
+from .trialspage import TrialsPage
 from .tabs import ONE, SIDE, STACKED, TabArea, layout_icon
 
 LIVE, REVIEW = "live", "review"
@@ -295,12 +296,12 @@ class MainWindow(QtWidgets.QMainWindow):
         lay.addWidget(self.bottom_bar)
         lay.addWidget(self.scroll)
         self.stim_page = StimPage(self)
+        self.trials_page = TrialsPage(self)
         placeholder = lambda title, text: self._placeholder(title, text)
         self.tabs = TabArea([
             ("acq", "Acquisition", central),
             ("stim", "Stimulator", self.stim_page),
-            ("trials", "Trials", placeholder("Trials", "Coming soon: overlay and average the pages "
-                                                      "around each stimulus.")),
+            ("trials", "Trials", self.trials_page),
             ("analysis", "Analysis", placeholder("Analysis", "Coming soon.")),
         ])
         self.tabs.changed.connect(self._tabs_changed)
@@ -398,7 +399,7 @@ class MainWindow(QtWidgets.QMainWindow):
         """
         self._clear_plot_area()
         inputs = valid_inputs(self.cfg)
-        locked = self.recorder.recording
+        locked = self.recorder.recording or (hasattr(self, "trials_page") and self.trials_page.running)
         for r in self.rows:
             strip = ChannelStrip(r, inputs, self.cfg.terminal_config == "DIFF",
                                  self._channel_edited, self._channel_removed, self._channel_recolored,
@@ -421,6 +422,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self._finish_plots()
         self.btn_add_ch.setEnabled(not locked)
         self.rate_box.setEnabled(not locked)
+        if hasattr(self, "trials_page"):
+            self.trials_page.sync()
 
     def _build_review_plots(self, names: list[str], units: list[str], colors: list[str]):
         """Plots for a saved session: one per recorded channel, with only a colour bar."""
@@ -488,6 +491,8 @@ class MainWindow(QtWidgets.QMainWindow):
         style.restyle(mode)
         self.comments_panel.link_color = style.tokens(mode)["link"]
         self.stim_page.apply_theme(mode)
+        if hasattr(self, "trials_page"):
+            self.trials_page.apply_theme(mode)
         self._update_theme_button()
         self.refresh_comments(redraw_markers=False)
 
@@ -552,8 +557,12 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _update_stim_chip(self):
         busy = self.stim_out is not None and self.stim_out.busy
-        on = self.repeating or busy
-        if on:
+        protocol = hasattr(self, "trials_page") and self.trials_page.running
+        on = self.repeating or busy or protocol
+        if protocol:
+            self.stim_chip_text.setText(self.trials_page.chip_text())
+            self.stim_chip.setToolTip("A trial protocol is running (Trials tab). Stop ends it.")
+        elif on:
             self.stim_chip_text.setText("Stimulating")      # the interval is in the tooltip
             self.stim_chip.setToolTip(f"Repeating every {self.stim_repeat_s:g} s" if self.repeating
                                       else "A stimulus is being sent")
@@ -693,6 +702,8 @@ class MainWindow(QtWidgets.QMainWindow):
 
         if self.recorder.recording:
             return refuse(f"Stop recording before changing the {what}.")
+        if hasattr(self, "trials_page") and self.trials_page.running:
+            return refuse(f"Stop the trial protocol before changing the {what}.")
         if self.mode != LIVE:
             return refuse(f"Go back to live mode to change the {what}.")
         rows = self._copy_rows() if rows is None else rows
@@ -1413,6 +1424,8 @@ class MainWindow(QtWidgets.QMainWindow):
         import json
         self.stimulus = s
         self.settings.setValue("stimulus", json.dumps(s.to_dict()))
+        if hasattr(self, "trials_page"):
+            self.trials_page.stimulus_changed()
 
     def open_stim_window(self) -> StimPage:
         """Show the Stimulator tab."""
@@ -1424,6 +1437,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.stim_page.show_message(text, error)
 
     def _escape(self):
+        if self.trials_page.running:
+            self.stop_stimulus()
+            return
         if self.repeating or (self.stim_out is not None and self.stim_out.busy):
             self.stop_stimulus()
             self._stim_message("Stimulus stopped")
@@ -1433,30 +1449,48 @@ class MainWindow(QtWidgets.QMainWindow):
         if self.stim_out is None:
             self._stim_message("The stimulator needs the nidaqmx (or simulated) backend.", error=True)
             return False
+        if self.trials_page.running:
+            self._stim_message("A trial protocol is running (Trials tab); stop it first.", error=True)
+            return False
+        try:
+            wave = self.stimulus.waveform(self.cfg.stim_rate)
+        except ValueError as e:
+            self._stim_message(str(e), error=True)
+            return False
+        return self.send_wave(wave, self.stimulus.describe())
+
+    def send_wave(self, wave, desc: str) -> bool:
+        """Send `wave` (volts at the output rate) and note it as a comment while recording."""
+        if self.stim_out is None:
+            self._stim_message("The stimulator needs the nidaqmx (or simulated) backend.", error=True)
+            return False
         if self.mode != LIVE or not self.backend.running:
             self._stim_message("Press Start first: stimuli are sent while acquiring.", error=True)
             return False
         try:
-            wave = self.stimulus.waveform(self.cfg.stim_rate)
             stimmod.check_limit(wave, self.cfg.stim_max_v)
             self.stim_out.fire(wave, self.cfg.stim_rate)
         except (ValueError, RuntimeError) as e:
             self._stim_message(str(e), error=True)
             return False
-        desc = self.stimulus.describe()
         if self.recorder.recording:
-            self._log_comment(f"Stim: {desc}")
+            self._log_comment(f"Stim: {desc}" if not desc.startswith("Trial") else desc)
         self._stim_message(f"Stimulus sent on {self.cfg.stim_output}: {desc}")
         self._update_stim_chip()
         return True
 
     def stop_stimulus(self) -> None:
+        if hasattr(self, "trials_page") and self.trials_page.running:
+            self.trials_page.stop_protocol("Protocol stopped")
         self.set_repeat(False)
         if self.stim_out is not None:
             self.stim_out.stop()
         self._update_stim_chip()
 
     def set_repeat(self, on: bool) -> None:
+        if on and hasattr(self, "trials_page") and self.trials_page.running:
+            self._stim_message("A trial protocol is running (Trials tab); stop it first.", error=True)
+            on = False
         if on and not self.repeating:
             self.repeating = True          # set first, so the chip shows "every N s"
             if not self.fire_stimulus():
@@ -1525,6 +1559,7 @@ class MainWindow(QtWidgets.QMainWindow):
             return False
         self.cfg.stim_monitor = phys
         self.stim_page.sync()
+        self.trials_page.sync()
         self.statusBar().showMessage(f"Recording the stimulus on {phys}" if phys
                                      else "Not recording the stimulus", 8000)
         return True
@@ -1717,6 +1752,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if not self._resolve_unsaved():
             ev.ignore()
             return
+        self.trials_page.shutdown()          # stops a protocol; deletes its plots now
         self.recorder.stop()
         self.stim_timer.stop()
         if self.stim_out is not None:

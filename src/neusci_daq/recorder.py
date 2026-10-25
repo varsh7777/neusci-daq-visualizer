@@ -103,6 +103,13 @@ class Recorder:
         """Stream time (s) of the first sample of the current or last block."""
         return self._t_offset or 0.0
 
+    def set_attr(self, key: str, value) -> None:
+        """Store extra information with the block being recorded (e.g. a trial protocol)."""
+        with self._lock:
+            if self._file is not None:
+                self._file.attrs[key] = value
+                self._file.flush()
+
     def get_comments(self) -> list[dict]:
         """Comments of the block being recorded, as [{t, sample_index, text}]."""
         with self._lock:

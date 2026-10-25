@@ -36,8 +36,12 @@ class Backend:
     # -- public API -------------------------------------------------------
     def subscribe(self) -> queue.Queue:
         q: queue.Queue = queue.Queue()
-        self._subs.append(q)
+        self._subs = self._subs + [q]       # replaced, not changed, so _publish never sees it mid-change
         return q
+
+    def unsubscribe(self, q: queue.Queue) -> None:
+        """Stop sending chunks to `q` (a queue nobody reads would grow forever)."""
+        self._subs = [s for s in self._subs if s is not q]
 
     def start(self) -> None:
         """Configure hardware in the caller's thread so setup errors raise here."""
