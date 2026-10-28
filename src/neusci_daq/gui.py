@@ -187,10 +187,16 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # Toolbar groups: shown per mode (live/review) and per visible tab.
         A = lambda w: tb.addWidget(w)
+        self.toolbar = tb
+        self.lbl_rate, self.lbl_window = QtWidgets.QLabel("Sampling rate"), QtWidgets.QLabel("Window")
+        self.rate_box.setToolTip("Sampling rate: samples per second, per channel")
+        self._short_rec = False          # "0:12" instead of "Stop recording · 0:12" when space is short
         self._tb_live = [A(self.btn_run), A(self.btn_rec), tb.addSeparator(),
-                         A(QtWidgets.QLabel("Sampling rate")), A(self.rate_box)]
+                         A(self.lbl_rate), A(self.rate_box)]
+        self._act_lbl_rate = self._tb_live[3]
         self._tb_review = [A(QtWidgets.QLabel("Block")), A(self.block_combo)]
-        self._tb_acq = [A(QtWidgets.QLabel("Window")), A(self.window_box)]
+        self._tb_acq = [A(self.lbl_window), A(self.window_box)]
+        self._act_lbl_window = self._tb_acq[0]
         self._tb_acq_live = [tb.addSeparator(), A(self.comment_edit)]
         self._tb_review.append(A(self.btn_live))
         spacer = QtWidgets.QWidget()            # fills the space when the comment box is hidden
@@ -568,6 +574,7 @@ class MainWindow(QtWidgets.QMainWindow):
             a.setVisible(live and acq)
         self._tb_spacer.setVisible(not (live and acq))
         self._update_stim_chip()
+        self._fit_toolbar()
 
     def _update_stim_chip(self):
         busy = self.stim_out is not None and self.stim_out.busy
@@ -582,6 +589,7 @@ class MainWindow(QtWidgets.QMainWindow):
                                       else "A stimulus is being sent")
         if self._tb_chip.isVisible() != on:
             self._tb_chip.setVisible(on)
+            self._fit_toolbar()
 
     # -- changing channels -------------------------------------------------
     def _copy_rows(self) -> list[ChannelRow]:
@@ -1411,7 +1419,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.blocks.append(path)
             self._update_title()
             self.statusBar().showMessage(f"Recording {path.name} in {self.session_dir}")
-            self.btn_rec.setText("Stop recording · 0:00")
+            self._set_rec_text(0.0)
             self.btn_rec.setIcon(style.dot_icon("#ffffff", square=True))
             self._lock_channels(True)
             self._set_comment_box(True)
@@ -1420,11 +1428,66 @@ class MainWindow(QtWidgets.QMainWindow):
             self._lock_channels(False)
             self.statusBar().showMessage(f"Saved {self.recorder.path.name}", 10000)
             self.btn_rec.setText("Record")
+            self.btn_rec.setToolTip("")
             self.btn_rec.setIcon(style.dot_icon(style.RECORDING))
             self._set_comment_box(False)
         # Starting a block keeps the previous block's comment lines: its data is
         # still on screen (now at negative times), and they scroll off with it.
         self.refresh_comments(redraw_markers=not on)
+        self._fit_toolbar()
+
+    def _set_rec_text(self, secs: float) -> None:
+        clock = f"{int(secs) // 60}:{int(secs) % 60:02d}"
+        self.btn_rec.setText(clock if self._short_rec else f"Stop recording · {clock}")
+        self.btn_rec.setToolTip("Stop recording" if self._short_rec else "")
+
+    def resizeEvent(self, ev):
+        super().resizeEvent(ev)
+        self._fit_toolbar()
+
+    def _fit_toolbar(self) -> None:
+        """Keep every control on the toolbar when the window is narrow (or the
+        system font is wide, as on macOS): first drop the "Sampling rate" label,
+        then "Window", then shorten "Stop recording · 0:12" to "0:12". Each comes
+        back as soon as there's room. Otherwise Qt hides whatever doesn't fit in
+        a » menu, which on a laptop was the light/dark and split buttons."""
+        tb = getattr(self, "toolbar", None)
+        if tb is None or not tb.isVisible():    # unshown: its width means nothing yet;
+            return                              # showing it sends a resizeEvent
+        lay = tb.layout()
+        labels = [(self._act_lbl_rate, self.lbl_rate), (self._act_lbl_window, self.lbl_window)]
+        label_acts = {act for act, _ in labels}
+        others = [tb.widgetForAction(a) for a in tb.actions() if a.isVisible() and a not in label_acts]
+        others = [w for w in others if w is not None]
+        wanted = [(act, lbl) for act, lbl in labels if self._label_wanted(act)]
+        n = len(others) + len(wanted)
+        m, lm = tb.contentsMargins(), lay.contentsMargins()
+        # Width with every wanted label shown and the full Record text.
+        full = (sum(w.sizeHint().width() for w in others) + sum(lbl.sizeHint().width() for _, lbl in wanted)
+                + lay.spacing() * max(0, n - 1) + m.left() + m.right() + lm.left() + lm.right() + 12)
+        recording = self.btn_rec.isChecked()
+        fm = self.btn_rec.fontMetrics()
+        rec_saving = fm.horizontalAdvance("Stop recording · ") if recording else 0
+        if self._short_rec:
+            full += rec_saving                  # the button is short right now
+        over = full - tb.width()
+        for act, lbl in wanted:                 # least important first
+            show = over <= 0
+            if not show:
+                over -= lbl.sizeHint().width() + lay.spacing()
+            act.setVisible(show)
+        short = recording and over > 0
+        if short != self._short_rec:
+            self._short_rec = short
+            if recording:
+                self._set_rec_text(self.recorder.samples_written / max(self.backend.actual_rate, 1e-9))
+
+    def _label_wanted(self, act) -> bool:
+        """Whether this label's group is showing at all (live mode; Acquisition visible)."""
+        if act is self._act_lbl_rate:
+            return self.mode == LIVE
+        return hasattr(self, "tabs") and self.tabs.is_visible("acq")
+
 
     def _lock_channels(self, locked: bool):
         for st in self.strips:
@@ -1779,6 +1842,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.buf_y = np.concatenate([self.buf_y, *ys], axis=1)[:, -self.cap:]
         if self.recorder.recording and self.recorder.block_started:
             self._set_axis_zero(self.recorder.block_start)   # exact block start
+        if not self.plots:
+            return
         x = self.buf_t - self._axis_zero
         t_end = x[-1]
         for ch, curve, y in zip(self.cfg.channels, self.curves, self.buf_y):
@@ -1796,7 +1861,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if self.recorder.recording and self.backend.hardware_timed:
             secs = self.recorder.samples_written / max(rate, 1e-9)
             msg += f" | recorded {secs:,.1f} s"
-            self.btn_rec.setText(f"Stop recording · {int(secs) // 60}:{int(secs) % 60:02d}")
+            self._set_rec_text(secs)
         if lag > 5:
             msg += f" | display lagging ({lag} chunks queued)"
         self.status.setText(msg)
@@ -1817,6 +1882,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if self.session_saved:
             self._autoexport_live()
         self.recorder.close()   # end the writer thread before Qt and h5py shut down
+        self.timer.stop()       # it draws on the plots, which are deleted next
         # Delete the plots now, in order. Left to Python's garbage collector, a
         # pyqtgraph plot can be freed while Qt still has a layout pass queued for
         # it, which crashes Qt (seen when windows are opened and closed repeatedly).

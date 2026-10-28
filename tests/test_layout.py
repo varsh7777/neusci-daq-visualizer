@@ -246,10 +246,34 @@ def test_stimulator_tab_shows_the_stimulus_that_fires(win):
     assert (s.amplitude_v, s.width_ms, s.count, s.interval_ms) == (2, 4, 4, 60)
 
 
+@pytest.fixture
+def scaled_win(request, tmp_path, app):
+    """A window built after widening the app font by request.param. It has to be
+    built after: widgets that already exist keep their size hints."""
+    from pyqtgraph.Qt import QtCore
+    from neusci_daq.gui import MainWindow
+    old_font = app.font()
+    f = QtGui.QFont(old_font)
+    f.setPointSizeF(old_font.pointSizeF() * request.param)
+    app.setFont(f)
+    st = QtCore.QSettings(str(tmp_path / "s.ini"), QtCore.QSettings.Format.IniFormat)
+    w = MainWindow(make_cfg(tmp_path), settings=st, config_path=tmp_path / "config.toml")
+    w._ask_unsaved = lambda: "discard"
+    try:
+        yield w
+    finally:
+        w.close()
+        app.setFont(old_font)
+
+
+@pytest.mark.parametrize("scaled_win", [1.0, 1.15, 1.3], indirect=True)
 @pytest.mark.parametrize("mode", [style.DARK, style.LIGHT])
-def test_everything_fits_on_a_1024_px_wide_window(app, win, mode):
+def test_everything_fits_on_a_1024_px_wide_window(app, scaled_win, mode):
     """A 1280 px laptop at 125% scaling is about 1024 px wide. Uses the real stylesheet:
-    unstyled widgets are narrower, so without it this passes when the app doesn't fit."""
+    unstyled widgets are narrower, so without it this passes when the app doesn't fit.
+    The font is widened too: macOS's is about 5% wider than Linux's, which is how this
+    failed on the Mac CI runner and passed everywhere else."""
+    win = scaled_win
     old_sheet, old_pal = app.styleSheet(), app.palette()
     try:
         style.apply(app, mode)
@@ -268,13 +292,59 @@ def test_everything_fits_on_a_1024_px_wide_window(app, win, mode):
             assert w.isVisible(), w                            # not in the overflow menu
             right = w.mapTo(win, w.rect().topRight()).x()
             assert right < win.width(), w
+        # Labels give way in order: "Sampling rate" goes before "Window".
+        assert not (win.lbl_rate.isVisible() and not win.lbl_window.isVisible())
+        assert win.btn_rec.text().endswith("0:00") or win.btn_rec.text().endswith("0:01")
         win.stop_stimulus()
         win.btn_rec.setChecked(False)
+        assert win.btn_rec.text() == "Record"
         win.btn_run.setChecked(False)
     finally:
         style._applied["mode"] = None
         app.setStyleSheet(old_sheet)
         app.setPalette(old_pal)
+
+
+def test_toolbar_labels_and_full_record_text_come_back_when_wide(app, win):
+    win.resize(1024, 640)
+    win.show()
+    win.btn_run.setChecked(True)
+    win.btn_rec.setChecked(True)
+    pump(app, 0.1)
+    win.resize(1600, 640)
+    pump(app, 0.1)
+    assert win.lbl_rate.isVisible() and win.lbl_window.isVisible()
+    assert win.btn_rec.text().startswith("Stop recording · ")
+    win.btn_rec.setChecked(False)
+    win.btn_run.setChecked(False)
+
+
+def test_short_record_text_keeps_its_meaning_in_a_tooltip(app, win):
+    win.resize(1024, 640)
+    win.show()
+    win.btn_run.setChecked(True)
+    win.btn_rec.setChecked(True)
+    pump(app, 0.1)
+    win.resize(500, 640)                                       # far too narrow
+    pump(app, 0.1)
+    assert win.btn_rec.text() in ("0:00", "0:01")
+    assert win.btn_rec.toolTip() == "Stop recording"
+    assert not win.lbl_rate.isVisible() and not win.lbl_window.isVisible()
+    win.btn_rec.setChecked(False)
+    assert (win.btn_rec.text(), win.btn_rec.toolTip()) == ("Record", "")
+    win.btn_run.setChecked(False)
+
+
+def test_closing_stops_the_redraw_timer(app, win):
+    """It used to keep firing after the plots were deleted: IndexError in _refresh."""
+    win.show()
+    win.btn_run.setChecked(True)
+    pump(app, 0.1)
+    win.btn_run.setChecked(False)
+    win._ask_unsaved = lambda: "discard"
+    win.close()
+    assert not win.timer.isActive()
+    win._refresh()                                             # and is harmless if it does run
 
 
 def test_split_and_theme_controls_sit_on_the_toolbar_row(app, win):
